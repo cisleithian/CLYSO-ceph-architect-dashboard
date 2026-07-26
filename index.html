@@ -1,0 +1,1898 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ceph Cluster Architect Dashboard</title>
+<meta name="description" content="Ceph Cluster Architect Dashboard - sizing, performance, cost and reliability in one live model. by Alex Weijlands." />
+<style>
+  html, body { margin: 0; padding: 0; background: #0f1419; color: #e6edf3;
+    font-family: system-ui, -apple-system, sans-serif; }
+  #root { min-height: 100vh; }
+  #boot { padding: 40px; font-family: ui-monospace, monospace; color: #8b98a5; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.2.0",
+    "react-dom": "https://esm.sh/react-dom@18.2.0?deps=react@18.2.0",
+    "react-dom/client": "https://esm.sh/react-dom@18.2.0/client?deps=react@18.2.0",
+    "recharts": "https://esm.sh/recharts@2.12.7?deps=react@18.2.0,react-dom@18.2.0&external=react,react-dom"
+  }
+}
+</script>
+</head>
+<body>
+<div id="root"><div id="boot">Loading dashboard&hellip;</div></div>
+<script type="module">
+import { createRoot } from "react-dom/client";
+// CephSizingDashboard.jsx
+import React, { useState, useMemo, useCallback } from "react";
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip as RTooltip,
+  ResponsiveContainer,
+  Legend,
+  Cell,
+  LineChart,
+  Line,
+  PieChart,
+  Pie
+} from "recharts";
+var roundUp = (x) => Math.ceil(x - 1e-9);
+var d1 = (x) => Number.isFinite(x) ? x.toFixed(1) : "\u2014";
+var n0 = (x) => Number.isFinite(x) ? Math.round(x).toLocaleString() : "\u2014";
+var SCHEMES = {
+  "Replication \xD72": { mult: 2, width: 2, tolerated: 1, k: 1, m: 1, wa: 2 },
+  "Replication \xD73": { mult: 3, width: 3, tolerated: 2, k: 1, m: 2, wa: 3 },
+  "EC 2+2": { mult: 2, width: 4, tolerated: 2, k: 2, m: 2, wa: 4 / 2 },
+  "EC 4+2": { mult: 1.5, width: 6, tolerated: 2, k: 4, m: 2, wa: 6 / 4 },
+  "EC 8+3": { mult: 1.375, width: 11, tolerated: 3, k: 8, m: 3, wa: 11 / 8 },
+  "EC 8+4": { mult: 1.5, width: 12, tolerated: 4, k: 8, m: 4, wa: 12 / 8 }
+};
+var SCHEME_KEYS = Object.keys(SCHEMES);
+function schemeSpec(t) {
+  if (t && t.scheme === "Custom EC") {
+    const k = Math.max(1, Math.round(t.ecK || 4));
+    const m = Math.max(1, Math.round(t.ecM || 2));
+    const width = k + m;
+    return { mult: width / k, width, tolerated: m, k, m, wa: width / k };
+  }
+  return SCHEMES[t.scheme];
+}
+function sizeScheme(c, s, isEC, target, fullness, a) {
+  const rawPerNode = c.driveSize * c.drivesPerNode;
+  const nodesCap = roundUp(target * s.mult / fullness / rawPerNode);
+  const nodes = Math.max(nodesCap, s.width + 1);
+  const usable = nodes * rawPerNode * fullness / s.mult;
+  const servers = nodes * c.price;
+  const cpu = isEC ? servers * (a.ecCpuPct / 100) : 0;
+  const net = nodes * 2 * a.portCost * (isEC ? a.ecNetFactor : 1);
+  const capex = servers + cpu + net;
+  const powerKw = nodes * a.wattsPerNode * a.pue / 1e3;
+  const energyYr = powerKw * 8760 * a.eurPerKwh;
+  return { rawPerNode, nodesCap, nodes, usable, servers, cpu, net, capex, powerKw, energyYr };
+}
+var DEFAULT_ASSUM = {
+  portCost: 800,
+  ecCpuPct: 15,
+  ecNetFactor: 1.5,
+  wattsPerNode: 450,
+  pue: 1.4,
+  eurPerKwh: 0.2,
+  years: 5,
+  uPerRack: 42,
+  portsPerSwitch: 32,
+  recoveryGBps: 2,
+  driveAFRpct: 1,
+  switchPrice: 8e3,
+  rackPrice: 1500
+};
+function chassisFor(t, chassis) {
+  return t && chassis.find((c) => c.id === t.chassisId) || chassis.find((c) => c.fav) || chassis[0];
+}
+function computeTier(t) {
+  const s = schemeSpec(t);
+  const mult = s.mult;
+  const width = s.width;
+  const fullness = t.fullness;
+  const rawRequired = t.usableTarget * mult / fullness;
+  const drivesRequired = roundUp(rawRequired / t.driveSize);
+  const nodesCapacity = roundUp(drivesRequired / t.drivesPerNode);
+  const selfHealMin = width + 1;
+  const nodesFinal = Math.max(nodesCapacity, selfHealMin);
+  const provDrives = nodesFinal * t.drivesPerNode;
+  const provRaw = provDrives * t.driveSize;
+  const provUsable = provRaw * fullness / mult;
+  const osds = provDrives;
+  const cpuCores = roundUp(osds * t.coresPerOSD);
+  const ramGB = osds * t.ramPerOSD;
+  const dbwalTB = provRaw * t.dbwalFraction;
+  const backendRequired = t.frontEnd * t.eastWest;
+  const usableMet = provUsable >= t.usableTarget;
+  return {
+    mult,
+    width,
+    tolerated: s.tolerated,
+    fullness,
+    rawRequired,
+    drivesRequired,
+    nodesCapacity,
+    selfHealMin,
+    nodesFinal,
+    provDrives,
+    provRaw,
+    provUsable,
+    osds,
+    cpuCores,
+    ramGB,
+    dbwalTB,
+    backendRequired,
+    usableMet
+  };
+}
+function reconChecks(t, r) {
+  return [
+    {
+      label: "Scheme feasible",
+      fix: { text: `Raise domains available to ${r.width + 1}`, patch: { domainsAvailable: r.width + 1 } },
+      ok: t.domainsAvailable >= r.width,
+      msg: `FAIL: ${t.domainsAvailable} domains < width ${r.width}`,
+      tip: `Every chunk/replica must land on its own failure domain, so you need at least width = ${r.width} domains. You have ${t.domainsAvailable} at the "${t.domainLevel}" level.${t.domainsAvailable >= r.width ? "" : " \u26A0 To fix: add failure domains (more hosts/racks at this level), or pick a narrower scheme (smaller width)."}`
+    },
+    {
+      label: "Self-heals on domain loss",
+      fix: { text: `Raise domains available to ${r.width + 1}`, patch: { domainsAvailable: r.width + 1 } },
+      ok: t.domainsAvailable >= r.width + 1,
+      msg: `FAIL: ${t.domainsAvailable} domains < width+1 (${r.width + 1})`,
+      tip: `To rebuild after losing one domain, Ceph needs a spare to recreate the missing chunk \u2014 so width + 1 = ${r.width + 1} domains. You have ${t.domainsAvailable}.${t.domainsAvailable >= r.width + 1 ? "" : " \u26A0 To fix: add at least one more failure domain, or narrow the scheme."}`
+    },
+    {
+      label: "Node count meets self-heal min",
+      ok: r.nodesFinal >= r.width + 1,
+      msg: `FAIL: ${r.nodesFinal} nodes < min ${r.width + 1}`,
+      tip: `Final node count must be \u2265 width + 1 = ${r.width + 1} so the cluster can self-heal. This tier is sized to ${r.nodesFinal} nodes.${r.nodesFinal >= r.width + 1 ? "" : " \u26A0 To fix: add nodes (the model normally floors to this automatically), or narrow the scheme."}`
+    },
+    {
+      label: "Resilience target met",
+      fix: { text: `Lower failures-to-survive to ${r.tolerated}`, patch: { failuresToSurvive: r.tolerated } },
+      ok: r.tolerated >= t.failuresToSurvive,
+      msg: `FAIL: tolerates ${r.tolerated} < needs ${t.failuresToSurvive}`,
+      tip: `The scheme survives ${r.tolerated} simultaneous domain failure(s) (tol = extra copies / parity chunks). Your target is ${t.failuresToSurvive}.${r.tolerated >= t.failuresToSurvive ? "" : " \u26A0 To fix: use more parity/replicas (larger m, or replication \xD73), or lower the failures-to-survive target."}`
+    },
+    {
+      label: "Back-end network adequate",
+      fix: { text: `Raise back-end available to ${d1(r.backendRequired)} GB/s`, patch: { backendAvailable: r.backendRequired } },
+      ok: t.backendAvailable >= r.backendRequired,
+      msg: `FAIL: ${d1(t.backendAvailable)} < required ${d1(r.backendRequired)} GB/s`,
+      tip: `Required back-end = front-end \xD7 east-west multiplier = ${d1(r.backendRequired)} GB/s (recovery/replication traffic). Available: ${d1(t.backendAvailable)} GB/s.${t.backendAvailable >= r.backendRequired ? "" : " \u26A0 To fix: provision more back-end bandwidth (faster NICs/switches), or lower the east-west multiplier / front-end target."}`
+    }
+  ];
+}
+var FIELD_NAMES = {
+  domainsAvailable: "Domains available",
+  failuresToSurvive: "Failures to survive",
+  backendAvailable: "Back-end avail (GB/s)"
+};
+var DEFAULT_CHASSIS = [
+  { id: "r760", name: "Dell R760xd2 (favoured)", u: 2, driveSize: 24, drivesPerNode: 24, cores: 32, ram: 256, netGb: 50, price: 32e3, fav: true },
+  { id: "r7615", name: "Dell R7615", u: 2, driveSize: 24, drivesPerNode: 12, cores: 32, ram: 192, netGb: 50, price: 3e4 },
+  { id: "r7715", name: "Dell R7715 (no rear slots)", u: 2, driveSize: 24, drivesPerNode: 12, cores: 32, ram: 192, netGb: 50, price: 3e4 },
+  { id: "r6615", name: "Dell R6615 (existing NVMe ref)", u: 1, driveSize: 6.4, drivesPerNode: 12, cores: 32, ram: 192, netGb: 200, price: 26e3 }
+];
+function chassisForTier(c, t) {
+  const s = schemeSpec(t);
+  const rawPerNode = c.driveSize * c.drivesPerNode;
+  const nodesCapacity = roundUp(t.usableTarget * s.mult / t.fullness / rawPerNode);
+  const selfHealMin = s.width + 1;
+  const nodes = Math.max(nodesCapacity, selfHealMin);
+  const capacityBound = nodesCapacity >= selfHealMin;
+  const aggRaw = nodes * rawPerNode;
+  const aggOSDs = nodes * c.drivesPerNode;
+  const aggU = nodes * c.u;
+  const eurPerRawTB = c.price / rawPerNode;
+  return { rawPerNode, nodes, nodesCapacity, selfHealMin, capacityBound, aggRaw, aggOSDs, aggU, eurPerRawTB, price: c.price };
+}
+var PERF_SCHEMES = ["Replication \xD73", "EC 4+2", "EC 8+3"];
+function perfCell(chassis, schemeKey, p) {
+  const s = SCHEMES[schemeKey];
+  const capHDD = roundUp(p.usable * s.mult / p.fullness / p.driveSize);
+  const readHDD = roundUp(p.readGBps * 1e3 / p.perHddMBps);
+  const writeHDD = roundUp(p.writeGBps * s.wa * 1e3 / p.perHddMBps);
+  const selfHealNodes = s.width + 1;
+  const maxSpindle = Math.max(capHDD, readHDD, writeHDD);
+  const nodesFromSpindle = roundUp(maxSpindle / chassis.drivesPerNode);
+  const nodesFinal = Math.max(nodesFromSpindle, selfHealNodes);
+  const totalHDDs = nodesFinal * chassis.drivesPerNode;
+  const provUsable = totalHDDs * p.driveSize * p.fullness / s.mult;
+  let binding;
+  if (selfHealNodes >= nodesFromSpindle) binding = "Self-heal";
+  else if (maxSpindle === writeHDD) binding = "Write";
+  else if (maxSpindle === readHDD) binding = "Read";
+  else binding = "Capacity";
+  return { capHDD, readHDD, writeHDD, selfHealNodes, nodesFinal, totalHDDs, provUsable, binding };
+}
+var C = {
+  bg: "#0f1419",
+  panel: "#171d26",
+  panel2: "#1c2530",
+  line: "#2a3644",
+  ink: "#e6edf3",
+  dim: "#8b98a5",
+  faint: "#5c6b7a",
+  accent: "#38bdf8",
+  edit: "#132a1e",
+  editLine: "#1f7a4d",
+  green: "#22c55e",
+  amber: "#f59e0b",
+  red: "#ef4444"
+};
+function Tip({ text, children, below, alignRight }) {
+  const [show, setShow] = useState(false);
+  return /* @__PURE__ */ React.createElement(
+    "span",
+    {
+      style: { position: "relative", borderBottom: `1px dotted ${C.faint}`, cursor: "help" },
+      onMouseEnter: () => setShow(true),
+      onMouseLeave: () => setShow(false)
+    },
+    children,
+    show && /* @__PURE__ */ React.createElement("span", { style: {
+      position: "absolute",
+      ...below ? { top: "130%" } : { bottom: "130%" },
+      ...alignRight ? { right: 0 } : { left: 0 },
+      zIndex: 50,
+      background: "#000",
+      color: C.ink,
+      border: `1px solid ${C.line}`,
+      padding: "6px 9px",
+      borderRadius: 6,
+      fontSize: 11,
+      lineHeight: 1.5,
+      width: 260,
+      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      whiteSpace: "normal",
+      boxShadow: "0 8px 24px rgba(0,0,0,.5)"
+    } }, text)
+  );
+}
+function Badge({ tone, children }) {
+  const map = {
+    green: [C.green, "rgba(34,197,94,.12)"],
+    amber: [C.amber, "rgba(245,158,11,.12)"],
+    red: [C.red, "rgba(239,68,68,.12)"],
+    neutral: [C.dim, "rgba(139,152,165,.1)"]
+  };
+  const [fg, bg] = map[tone] || map.neutral;
+  return /* @__PURE__ */ React.createElement("span", { style: {
+    color: fg,
+    background: bg,
+    border: `1px solid ${fg}44`,
+    padding: "2px 8px",
+    borderRadius: 5,
+    fontSize: 11,
+    fontWeight: 700,
+    fontFamily: "ui-monospace, monospace",
+    letterSpacing: ".02em",
+    whiteSpace: "nowrap"
+  } }, children);
+}
+var SCOPE_STYLES = { tier: C.accent, cluster: C.amber, standalone: C.faint };
+function ScopeChip({ kind, name }) {
+  const color = SCOPE_STYLES[kind] || SCOPE_STYLES.standalone;
+  const text = kind === "tier" ? `\u25B8 ${name || "selected tier"}` : kind === "cluster" ? "\u25C6 whole cluster" : "\u2699 standalone inputs";
+  return /* @__PURE__ */ React.createElement("span", { style: {
+    color,
+    background: `${color}18`,
+    border: `1px solid ${color}55`,
+    padding: "2px 8px",
+    borderRadius: 20,
+    fontSize: 10.5,
+    fontWeight: 700,
+    fontFamily: "ui-monospace, monospace",
+    whiteSpace: "nowrap",
+    letterSpacing: ".02em"
+  } }, text);
+}
+var SECTION_Q = {
+  1: "Which workloads does this cluster serve?",
+  2: "What should this tier deliver, and on what hardware?",
+  3: "How much hardware, and is the design safe?",
+  4: "What's the full cluster, in one place?",
+  5: "Which server model fits this tier best?",
+  6: "How is redundancy laid out physically?",
+  7: "How many racks and switches, and how are nodes spread?",
+  8: "Is the network sized for client and rebuild traffic?",
+  9: "What does each design choice cost?",
+  10: "When does erasure coding start paying off?",
+  11: "What's the real multi-year cost, energy included?",
+  12: "How much usable space per euro of raw disk?",
+  13: "How exposed am I while recovering from a failure?",
+  14: "What actually happens when things break?",
+  15: "When do I need to buy more?",
+  16: "What exactly do I order, and for how much?",
+  17: "What's the all-in cost of the entire cluster?",
+  18: "Is my cluster sized by speed or by space?"
+};
+function Card({ title, right, children, accent, scope, num, id, desc }) {
+  return /* @__PURE__ */ React.createElement("div", { id, style: {
+    background: C.panel,
+    border: `1px solid ${C.line}`,
+    borderTop: accent ? `2px solid ${accent}` : `1px solid ${C.line}`,
+    borderRadius: 10,
+    padding: 16,
+    marginBottom: 16,
+    scrollMarginTop: 12
+  } }, title && /* @__PURE__ */ React.createElement("div", { style: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: desc ? 4 : 12,
+    gap: 10,
+    flexWrap: "wrap"
+  } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } }, num != null && /* @__PURE__ */ React.createElement("span", { style: {
+    color: C.accent,
+    background: `${C.accent}18`,
+    border: `1px solid ${C.accent}55`,
+    borderRadius: 6,
+    padding: "1px 7px",
+    fontSize: 11,
+    fontWeight: 700,
+    fontFamily: "ui-monospace, monospace"
+  } }, "\xA7", num), /* @__PURE__ */ React.createElement("h3", { style: {
+    margin: 0,
+    fontSize: 12,
+    fontWeight: 700,
+    letterSpacing: ".08em",
+    textTransform: "uppercase",
+    color: C.dim,
+    fontFamily: "ui-monospace, monospace"
+  } }, title), scope && /* @__PURE__ */ React.createElement(ScopeChip, { ...scope })), right), desc && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: C.faint, marginBottom: num != null && SECTION_Q[num] ? 3 : 12, fontFamily: "ui-monospace, monospace", fontStyle: "italic" } }, desc), num != null && SECTION_Q[num] && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, marginBottom: 12, fontFamily: "ui-monospace, monospace" } }, /* @__PURE__ */ React.createElement("span", { style: { color: C.accent, fontWeight: 700 } }, "Answers: "), /* @__PURE__ */ React.createElement("span", { style: { color: C.dim, fontStyle: "italic" } }, SECTION_Q[num])), children);
+}
+var inputStyle = {
+  background: C.panel2,
+  border: `1px solid ${C.line}`,
+  color: C.ink,
+  borderRadius: 6,
+  padding: "6px 8px",
+  fontSize: 13,
+  width: "100%",
+  fontFamily: "ui-monospace, monospace",
+  outline: "none"
+};
+function Field({ label, tip, children }) {
+  return /* @__PURE__ */ React.createElement("label", { style: { display: "block", marginBottom: 10 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.dim, marginBottom: 4, fontFamily: "ui-monospace, monospace" } }, tip ? /* @__PURE__ */ React.createElement(Tip, { text: tip }, label) : label), children);
+}
+function Num({ value, onChange, step = 1, min }) {
+  return /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      type: "number",
+      value,
+      step,
+      min,
+      onChange: (e) => onChange(parseFloat(e.target.value)),
+      style: inputStyle
+    }
+  );
+}
+var greenInputStyle = {
+  background: C.edit,
+  border: `1px solid ${C.editLine}`,
+  color: "#7ee2a8",
+  borderRadius: 6,
+  padding: "6px 8px",
+  fontSize: 13,
+  width: "100%",
+  fontFamily: "ui-monospace, monospace",
+  outline: "none"
+};
+function GreenNum({ value, onChange, step = 1, min }) {
+  return /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      type: "number",
+      value,
+      step,
+      min,
+      onChange: (e) => onChange(parseFloat(e.target.value)),
+      style: greenInputStyle
+    }
+  );
+}
+function Row({ k, v, tone }) {
+  return /* @__PURE__ */ React.createElement("div", { style: {
+    display: "flex",
+    justifyContent: "space-between",
+    padding: "4px 0",
+    borderBottom: `1px solid ${C.panel2}`,
+    fontSize: 13,
+    fontFamily: "ui-monospace, monospace"
+  } }, /* @__PURE__ */ React.createElement("span", { style: { color: C.dim } }, k), /* @__PURE__ */ React.createElement("span", { style: { color: tone || C.ink, fontWeight: 600 } }, v));
+}
+var tierDefaults = (name, over) => ({
+  name,
+  usableTarget: 120,
+  scheme: "Replication \xD73",
+  fullness: 0.8,
+  chassisId: "r760",
+  ecK: 4,
+  ecM: 2,
+  usedStartTB: 0,
+  growthTBmo: 20,
+  driveSize: 6.4,
+  drivesPerNode: 12,
+  coresPerOSD: 2,
+  ramPerOSD: 5,
+  dbwalFraction: 0,
+  frontEnd: 8,
+  eastWest: 3,
+  domainLevel: "host",
+  domainsAvailable: 6,
+  failuresToSurvive: 1,
+  backendAvailable: 24,
+  ...over
+});
+var initialTiers = [
+  tierDefaults("Fast Tier"),
+  tierDefaults("Capacity Tier", {
+    usableTarget: 300,
+    driveSize: 24,
+    coresPerOSD: 1,
+    ramPerOSD: 4,
+    dbwalFraction: 0.02,
+    frontEnd: 8,
+    eastWest: 3,
+    domainsAvailable: 12
+  })
+];
+var CLYSO_LOGO = "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPCEtLSBHZW5lcmF0b3I6IEFkb2JlIElsbHVzdHJhdG9yIDI2LjQuMSwgU1ZHIEV4cG9ydCBQbHVnLUluIC4gU1ZHIFZlcnNpb246IDYuMDAgQnVpbGQgMCkgIC0tPgo8c3ZnIHZlcnNpb249IjEuMSIgaWQ9IkViZW5lXzEiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGxpbmsiIHg9IjBweCIgeT0iMHB4IgoJIHZpZXdCb3g9IjAgMCAyODMuNDY1IDYzLjQ5MyIgc3R5bGU9ImVuYWJsZS1iYWNrZ3JvdW5kOm5ldyAwIDAgMjgzLjQ2NSA2My40OTM7IiB4bWw6c3BhY2U9InByZXNlcnZlIj4KPHN0eWxlIHR5cGU9InRleHQvY3NzIj4KCS5zdDB7ZmlsbDojRkZGRkZGO30KPC9zdHlsZT4KPGc+Cgk8cGF0aCBjbGFzcz0ic3QwIiBkPSJNMjMuNzIsMjAuMTYzYzUuMDQyLDAsOC45NjQsMi4zMzIsMTEuOTczLDcuMTIxbDcuOTE1LTUuMzc3Yy00LjA2NC03LjE2Ny0xMS4yNTUtMTEuMjY0LTE5LjgxOS0xMS4yNjQKCQlDMTAuNDQ5LDEwLjY0MywwLDIwLjY0MiwwLDMzLjQwNXMxMC40MTksMjIuNzYxLDIzLjcyLDIyLjc2MWM4LjYwNywwLDE1LjgyMi00LjA5NywxOS44ODctMTEuMjY0bC03LjkxNS01LjM3OAoJCWMtMy4wMDgsNC43OTEtNi45Myw3LjEyMS0xMS45NzMsNy4xMjFjLTcuNjM2LDAtMTIuOTY5LTUuNDE3LTEyLjk2OS0xMy4xNzNDMTAuNzUxLDI1LjYzNiwxNi4wODQsMjAuMTYzLDIzLjcyLDIwLjE2M3oiLz4KCTxwb2x5Z29uIGNsYXNzPSJzdDAiIHBvaW50cz0iNzcuMzU2LDExLjQ2NCA2Ni44NzksMTEuNDY0IDY2Ljg3OSw1NS4zNDUgOTYuMDQzLDU1LjM0NSA5Ni4wNDMsNDYuMDMxIDc3LjM1Niw0Ni4wMzEgCSIvPgoJPHBhdGggY2xhc3M9InN0MCIgZD0iTTIwNC4xMTcsMjkuNjkxbC01LjIwMy0yLjE5MWMtMi43ODctMS4xNTUtNC4yOTgtMi4xODItNC4yOTgtNC4yOTNjMC0yLjIzOCwxLjcwOC0zLjUyMiw0LjY4NS0zLjUyMgoJCWMzLjUzLDAsNS42NDQsMS43ODIsNy42MDUsNC41MTNsNi45MDItNS4yODJjLTIuMDg1LTMuODgzLTYuMjkyLTguMjcyLTE0LjY0My04LjI3MmMtOS4wNywwLTE1LjE2NSw1LjEwNC0xNS4xNjUsMTIuNwoJCWMwLDUuNjY0LDMuNDA3LDkuNjgyLDExLjA0NCwxMy4wMjdsNC42NTUsMi4wNTVjMy4xLDEuMzQ3LDQuOTcyLDIuMTYxLDQuOTcyLDQuNzY4YzAsMS43OTQtMC45MTksMy45MzMtNS4zMDIsMy45MzMKCQljLTUuMDI5LDAtNy45ODktMi43MjgtMTAuMTg1LTUuNTU4bC02Ljk4LDUuMjkzYzMuMzE3LDUuODM3LDkuNjksOS4zMDUsMTcuMTY1LDkuMzA1YzkuNTIsMCwxNS45MTctNS40MDYsMTUuOTE3LTEzLjQ1MwoJCUMyMTUuMjg3LDM2Ljc4MSwyMTIuMDUxLDMzLjAwOCwyMDQuMTE3LDI5LjY5MXoiLz4KCTxwYXRoIGNsYXNzPSJzdDAiIGQ9Ik0yNTkuNjc3LDEwLjY0M2MtMTMuMjYyLDAtMjMuNjUyLDkuOTk4LTIzLjY1MiwyMi43NjJzMTAuMzksMjIuNzYxLDIzLjY1MiwyMi43NjEKCQljMTMuMzM5LDAsMjMuNzg4LTkuOTk4LDIzLjc4OC0yMi43NjFTMjczLjAxNiwxMC42NDMsMjU5LjY3NywxMC42NDN6IE0yNTkuNzQ1LDQ2LjY0NmMtNy43NTcsMC0xMi45NjgtNS4zMjEtMTIuOTY4LTEzLjI0MQoJCWMwLTcuNzk3LDUuMzMyLTEzLjI0MywxMi45NjgtMTMuMjQzYzcuNTEzLDAsMTIuOTY3LDUuNTcsMTIuOTY3LDEzLjI0M0MyNzIuNzEyLDQxLjIwMiwyNjcuMzgsNDYuNjQ2LDI1OS43NDUsNDYuNjQ2eiIvPgoJPHJlY3QgeD0iMTMxLjUyNyIgeT0iNDUuOTk4IiBjbGFzcz0ic3QwIiB3aWR0aD0iMTAuNDciIGhlaWdodD0iMTcuNDk1Ii8+CgkKCQk8cmVjdCB4PSIxMDguMjQ0IiB5PSIxLjQwOSIgdHJhbnNmb3JtPSJtYXRyaXgoMC44MTA1IC0wLjU4NTcgMC41ODU3IDAuODEwNSAxNS41NTU2IDY4LjM5MzkpIiBjbGFzcz0ic3QwIiB3aWR0aD0iMTAuNDciIGhlaWdodD0iMTcuNDk1Ii8+CgkKCQk8cmVjdCB4PSIxNTEuMzAxIiB5PSI0LjkyMiIgdHJhbnNmb3JtPSJtYXRyaXgoMC41ODU0IC0wLjgxMDcgMC44MTA3IDAuNTg1NCA1OC4xMTc5IDEzMy45NjcyKSIgY2xhc3M9InN0MCIgd2lkdGg9IjE3LjQ5NSIgaGVpZ2h0PSIxMC40NyIvPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+Cjwvc3ZnPgo=";
+var TOC = [
+  [1, "sec-tiers", "Tiers"],
+  [2, "sec-inputs", "Inputs"],
+  [3, "sec-results", "Results & checks"],
+  [4, "sec-totals", "Cluster totals"],
+  [5, "sec-chassis", "Chassis comparison"],
+  [6, "sec-topology", "Topology & failure domains"],
+  [7, "sec-rack", "Rack & network layout"],
+  [8, "sec-network", "Network planes"],
+  [9, "sec-tco", "Cost of ownership"],
+  [10, "sec-crossover", "Cost vs capacity"],
+  [11, "sec-power", "Power & multi-year TCO"],
+  [12, "sec-overhead", "Capacity efficiency"],
+  [13, "sec-rebuild", "Rebuild time & risk"],
+  [14, "sec-failure", "Failure simulator"],
+  [15, "sec-growth", "Growth runway"],
+  [16, "sec-bom", "Procurement BOM"],
+  [17, "sec-rollup", "Cluster cost roll-up"],
+  [18, "sec-perf", "Performance options"]
+];
+function App() {
+  const [tiers, setTiers] = useState(initialTiers);
+  const [chassis, setChassis] = useState(DEFAULT_CHASSIS);
+  const [selTier, setSelTier] = useState(0);
+  const [snapA, setSnapA] = useState(null);
+  const [snapB, setSnapB] = useState(null);
+  const [perf, setPerf] = useState({
+    perHddMBps: 200,
+    writeGBps: 4.8,
+    readGBps: 10,
+    usable: 300,
+    fullness: 0.8,
+    driveSize: 24
+  });
+  const [assum, setAssum] = useState(DEFAULT_ASSUM);
+  const results = useMemo(() => tiers.map(computeTier), [tiers]);
+  const totals = useMemo(() => {
+    const acc = {
+      nodes: 0,
+      osds: 0,
+      cores: 0,
+      ram: 0,
+      raw: 0,
+      usable: 0,
+      dbwal: 0,
+      backend: 0
+    };
+    results.forEach((r) => {
+      acc.nodes += r.nodesFinal;
+      acc.osds += r.osds;
+      acc.cores += r.cpuCores;
+      acc.ram += r.ramGB;
+      acc.raw += r.provRaw;
+      acc.usable += r.provUsable;
+      acc.dbwal += r.dbwalTB;
+      acc.backend += r.backendRequired;
+    });
+    acc.ports = acc.nodes * 2;
+    acc.link = acc.backend > 15 ? "25/100 GbE" : "25 GbE";
+    return acc;
+  }, [results]);
+  const updateTier = useCallback((i, patch) => {
+    setTiers((ts) => ts.map((t2, j) => j === i ? { ...t2, ...patch } : t2));
+  }, []);
+  const setScheme = (i, scheme) => updateTier(i, { scheme });
+  const addTier = () => setTiers((ts) => [...ts, tierDefaults(`Tier ${ts.length + 1}`)]);
+  const removeTier = (i) => {
+    setTiers((ts) => ts.filter((_, j) => j !== i));
+    setSelTier((s) => Math.max(0, s >= tiers.length - 1 ? tiers.length - 2 : s));
+  };
+  const updateChassis = (id, patch) => setChassis((cs) => cs.map((c) => c.id === id ? { ...c, ...patch } : c));
+  const addChassis = () => setChassis((cs) => [...cs, {
+    id: "c" + Date.now(),
+    name: "New chassis",
+    u: 2,
+    driveSize: 24,
+    drivesPerNode: 12,
+    cores: 32,
+    ram: 192,
+    netGb: 50,
+    price: 3e4,
+    fav: false
+  }]);
+  const removeChassis = (id) => setChassis((cs) => {
+    if (cs.length <= 1) return cs;
+    const next = cs.filter((c) => c.id !== id);
+    if (!next.some((c) => c.fav)) next[0] = { ...next[0], fav: true };
+    return next;
+  });
+  const setFav = (id) => setChassis((cs) => cs.map((c) => ({ ...c, fav: c.id === id })));
+  const exportCSV = () => {
+    const lines = [["Tier", "Scheme", "Nodes", "OSDs", "Cores", "RAM_GB", "Raw_TB", "Usable_TB", "DBWAL_TB", "Backend_GBps", "UsableMet"]];
+    tiers.forEach((t2, i) => {
+      const r = results[i];
+      lines.push([t2.name, t2.scheme, r.nodesFinal, r.osds, r.cpuCores, r.ramGB, d1(r.provRaw), d1(r.provUsable), d1(r.dbwalTB), d1(r.backendRequired), r.usableMet ? "YES" : "NO"]);
+    });
+    lines.push([]);
+    lines.push(["TOTALS", "", totals.nodes, totals.osds, totals.cores, totals.ram, d1(totals.raw), d1(totals.usable), d1(totals.dbwal), d1(totals.backend), ""]);
+    lines.push(["Ports (pub=clus)", totals.ports, "Link", totals.link]);
+    const csv = lines.map((r) => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "ceph-bom.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  const buildSummaryHTML = () => {
+    const rows = tiers.map((t2, i) => {
+      const r = results[i];
+      return `<tr><td>${t2.name}</td><td>${t2.scheme}</td><td>${r.nodesFinal}</td><td>${r.osds}</td><td>${r.cpuCores}</td><td>${n0(r.ramGB)}</td><td>${d1(r.provRaw)}</td><td>${d1(r.provUsable)}</td></tr>`;
+    }).join("");
+    return `<!doctype html><html><head><meta charset="utf-8"><title>Ceph BOM</title><style>body{font-family:sans-serif;padding:30px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px 10px;text-align:right}td:first-child,th:first-child{text-align:left}h1{font-size:18px}</style></head><body><h1>Ceph Cluster BOM</h1><table><tr><th>Tier</th><th>Scheme</th><th>Nodes</th><th>OSDs</th><th>Cores</th><th>RAM GB</th><th>Raw TB</th><th>Usable TB</th></tr>${rows}<tr style="font-weight:bold"><td>TOTAL</td><td></td><td>${totals.nodes}</td><td>${totals.osds}</td><td>${totals.cores}</td><td>${n0(totals.ram)}</td><td>${d1(totals.raw)}</td><td>${d1(totals.usable)}</td></tr></table><p>Network: ${totals.ports} public + ${totals.ports} cluster ports \xB7 Link ${totals.link} \xB7 Aggregate back-end ${d1(totals.backend)} GB/s</p></body></html>`;
+  };
+  const printSummary = () => {
+    const html = buildSummaryHTML();
+    try {
+      const iframe = document.createElement("iframe");
+      iframe.style.position = "fixed";
+      iframe.style.right = "0";
+      iframe.style.bottom = "0";
+      iframe.style.width = "0";
+      iframe.style.height = "0";
+      iframe.style.border = "0";
+      document.body.appendChild(iframe);
+      const doc = iframe.contentWindow?.document;
+      if (!doc) throw new Error("no iframe document");
+      doc.open();
+      doc.write(html);
+      doc.close();
+      const cleanup = () => setTimeout(() => iframe.remove(), 500);
+      iframe.contentWindow.onafterprint = cleanup;
+      setTimeout(() => {
+        try {
+          iframe.contentWindow.focus();
+          iframe.contentWindow.print();
+        } catch (e) {
+          iframe.remove();
+          downloadSummary(html);
+        }
+        cleanup();
+      }, 150);
+    } catch (e) {
+      downloadSummary(html);
+    }
+  };
+  const downloadSummary = (html) => {
+    const blob = new Blob([html || buildSummaryHTML()], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "ceph-bom-summary.html";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  const snapshot = (slot) => {
+    const snap = { tiers: JSON.parse(JSON.stringify(tiers)), totals: { ...totals } };
+    slot === "A" ? setSnapA(snap) : setSnapB(snap);
+  };
+  const exportConfig = () => {
+    const cfg = { version: 1, tiers, chassis, perf, assum };
+    const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "ceph-sizing-config.json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  const importConfig = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const cfg = JSON.parse(reader.result);
+        if (Array.isArray(cfg.tiers)) setTiers(cfg.tiers);
+        if (Array.isArray(cfg.chassis)) setChassis(cfg.chassis);
+        if (cfg.perf) setPerf(cfg.perf);
+        if (cfg.assum) setAssum({ ...DEFAULT_ASSUM, ...cfg.assum });
+        setSelTier(0);
+      } catch (err) {
+        alert("Could not read that config file: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+  const t = tiers[selTier] || tiers[0];
+  const st = selTier >= tiers.length ? 0 : selTier;
+  return /* @__PURE__ */ React.createElement("div", { style: {
+    background: C.bg,
+    color: C.ink,
+    minHeight: "100vh",
+    padding: 20,
+    fontFamily: "system-ui, -apple-system, sans-serif"
+  } }, /* @__PURE__ */ React.createElement("style", null, `
+        input[type=range]{accent-color:${C.accent}}
+        input:focus{border-color:${C.accent}!important}
+        button{cursor:pointer}
+        @media(max-width:900px){.split{grid-template-columns:1fr!important}}
+      `), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 18, marginBottom: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("img", { src: CLYSO_LOGO, alt: "Clyso", style: { height: 42, flexShrink: 0 } }), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h1", { style: { margin: 0, fontSize: 23, letterSpacing: "-.01em", lineHeight: 1.15 } }, "Ceph Cluster Architect Dashboard"), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11.5, color: C.dim, fontFamily: "ui-monospace, monospace", letterSpacing: ".12em", textTransform: "uppercase", fontWeight: 700 } }, "Cluster Planner"), /* @__PURE__ */ React.createElement("span", { style: { color: C.faint } }, "\xB7"), [["Sizing", C.accent], ["Performance", C.amber], ["Cost", C.green], ["Reliability", C.red]].map(([w, col]) => /* @__PURE__ */ React.createElement("span", { key: w, style: {
+    fontSize: 11,
+    color: col,
+    background: `${col}14`,
+    border: `1px solid ${col}55`,
+    borderRadius: 20,
+    padding: "2px 10px",
+    fontFamily: "ui-monospace, monospace",
+    letterSpacing: ".04em",
+    fontWeight: 700
+  } }, w))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8, fontSize: 12.5, color: C.dim, fontFamily: "ui-monospace, monospace" } }, "by Alex Weijlands"), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 2, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace" } }, "version 0.1 Draft \xB7 live model \xB7 hover any label for its formula"))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 14, fontSize: 11.5, fontFamily: "ui-monospace, monospace" } }, /* @__PURE__ */ React.createElement("span", { style: { color: C.faint } }, "Each section's scope is tagged:"), /* @__PURE__ */ React.createElement("span", { style: { color: C.accent } }, "\u25B8 selected tier"), /* @__PURE__ */ React.createElement("span", { style: { color: C.amber } }, "\u25C6 whole cluster"), /* @__PURE__ */ React.createElement("span", { style: { color: C.faint } }, "\u2699 standalone inputs")), /* @__PURE__ */ React.createElement(Card, { title: "Contents \xB7 jump to a section" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: "6px 18px", fontSize: 12, fontFamily: "ui-monospace, monospace" } }, TOC.map(([n, id, label]) => /* @__PURE__ */ React.createElement(
+    "a",
+    {
+      key: id,
+      href: `#${id}`,
+      onClick: (e) => {
+        e.preventDefault();
+        const el = document.getElementById(id);
+        if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+      },
+      style: { color: C.accent, textDecoration: "none", whiteSpace: "nowrap" }
+    },
+    /* @__PURE__ */ React.createElement("span", { style: { color: C.faint } }, n, "."),
+    " ",
+    label
+  )))), /* @__PURE__ */ React.createElement(Card, { title: "Tiers", num: 1, id: "sec-tiers", desc: "Add, rename, and pick which tier you're editing." }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" } }, tiers.map((tt, i) => /* @__PURE__ */ React.createElement("div", { key: i, style: { display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: tt.name,
+      onChange: (e) => updateTier(i, { name: e.target.value }),
+      onFocus: () => setSelTier(i),
+      onClick: () => setSelTier(i),
+      style: {
+        ...inputStyle,
+        width: 130,
+        borderColor: st === i ? C.accent : C.line,
+        background: st === i ? "rgba(56,189,248,.12)" : C.panel2,
+        fontWeight: st === i ? 700 : 400
+      }
+    }
+  ), tiers.length > 1 && /* @__PURE__ */ React.createElement("button", { onClick: () => removeTier(i), style: {
+    background: "transparent",
+    color: C.red,
+    border: `1px solid ${C.red}55`,
+    borderRadius: 6,
+    width: 26,
+    height: 30,
+    fontSize: 15
+  } }, "\xD7"))), /* @__PURE__ */ React.createElement("button", { onClick: addTier, style: {
+    background: C.panel2,
+    color: C.accent,
+    border: `1px solid ${C.accent}55`,
+    borderRadius: 6,
+    padding: "6px 12px",
+    fontSize: 13,
+    fontWeight: 600
+  } }, "+ Add tier"))), /* @__PURE__ */ React.createElement("div", { className: "split", style: { display: "grid", gridTemplateColumns: "1fr 2fr", gap: 16 } }, /* @__PURE__ */ React.createElement("div", null, tiers.map((tt, i) => {
+    if (i !== st) return null;
+    return /* @__PURE__ */ React.createElement(
+      Card,
+      {
+        key: i,
+        title: `Inputs \xB7 ${tt.name}`,
+        accent: C.accent,
+        num: 2,
+        id: "sec-inputs",
+        desc: "Capacity target, protection scheme, drives and chassis for the selected tier.",
+        right: /* @__PURE__ */ React.createElement(Badge, { tone: results[i].usableMet ? "green" : "red" }, results[i].usableMet ? "MEETS TARGET" : "SHORT")
+      },
+      /* @__PURE__ */ React.createElement(
+        Field,
+        {
+          label: "Usable capacity target (TB)",
+          tip: "Your requested usable capacity for this tier."
+        },
+        /* @__PURE__ */ React.createElement(
+          Num,
+          {
+            value: tt.usableTarget,
+            step: 10,
+            onChange: (v) => updateTier(i, { usableTarget: v })
+          }
+        )
+      ),
+      /* @__PURE__ */ React.createElement(
+        Field,
+        {
+          label: "Protection scheme",
+          tip: "Sets raw multiplier & protection width automatically."
+        },
+        /* @__PURE__ */ React.createElement(
+          "select",
+          {
+            value: tt.scheme,
+            onChange: (e) => setScheme(i, e.target.value),
+            style: inputStyle
+          },
+          SCHEME_KEYS.map((k) => /* @__PURE__ */ React.createElement("option", { key: k, value: k }, k, " \xB7 \xD7", SCHEMES[k].mult, " \xB7 w", SCHEMES[k].width, " \xB7 tol ", SCHEMES[k].tolerated)),
+          /* @__PURE__ */ React.createElement("option", { value: "Custom EC" }, "Custom EC \xB7 define k + m\u2026")
+        )
+      ),
+      tt.scheme === "Custom EC" && (() => {
+        const sp = schemeSpec(tt);
+        return /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 } }, /* @__PURE__ */ React.createElement(Field, { label: "EC data chunks (k)", tip: "Data chunks per stripe. Usable share = k / (k+m); more k = less overhead." }, /* @__PURE__ */ React.createElement(
+          GreenNum,
+          {
+            value: tt.ecK,
+            step: 1,
+            min: 1,
+            onChange: (v) => updateTier(i, { ecK: Math.max(1, Math.round(v || 1)) })
+          }
+        )), /* @__PURE__ */ React.createElement(Field, { label: "EC parity chunks (m)", tip: "Parity chunks per stripe = failures tolerated (tol). More m = more resilient, wider stripe." }, /* @__PURE__ */ React.createElement(
+          GreenNum,
+          {
+            value: tt.ecM,
+            step: 1,
+            min: 1,
+            onChange: (v) => updateTier(i, { ecM: Math.max(1, Math.round(v || 1)) })
+          }
+        )), /* @__PURE__ */ React.createElement("div", { style: { gridColumn: "1 / -1", fontSize: 11.5, color: C.dim, fontFamily: "ui-monospace, monospace" } }, "\u2192 EC ", sp.k, "+", sp.m, " \xB7 \xD7", sp.mult.toFixed(3), " raw \xB7 width ", sp.width, " \xB7 tol ", sp.tolerated, " \xB7 self-heal min ", sp.width + 1, " nodes"));
+      })(),
+      /* @__PURE__ */ React.createElement(
+        Field,
+        {
+          label: `Target max fullness: ${tt.fullness.toFixed(2)}`,
+          tip: "Cluster is sized so it never fills past this fraction."
+        },
+        /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "range",
+            min: 0.7,
+            max: 0.8,
+            step: 0.01,
+            value: tt.fullness,
+            onChange: (e) => updateTier(i, { fullness: parseFloat(e.target.value) }),
+            style: { width: "100%" }
+          }
+        )
+      ),
+      /* @__PURE__ */ React.createElement(Field, { label: "Chassis for this tier", tip: "Which server model this tier is built on. Drives the cost, power, rack, network, topology and roll-up sections for this tier." }, /* @__PURE__ */ React.createElement("select", { value: tt.chassisId || chassis[0] && chassis[0].id, onChange: (e) => updateTier(i, { chassisId: e.target.value }), style: inputStyle }, chassis.map((c) => /* @__PURE__ */ React.createElement("option", { key: c.id, value: c.id }, c.name)))),
+      (() => {
+        const favForTier = chassisFor(tt, chassis);
+        const mism = tt.driveSize !== favForTier.driveSize || tt.drivesPerNode !== favForTier.drivesPerNode;
+        const hasSaved = tt.savedDrive != null;
+        return /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            onClick: () => updateTier(i, {
+              driveSize: favForTier.driveSize,
+              drivesPerNode: favForTier.drivesPerNode,
+              ...hasSaved ? {} : { savedDrive: tt.driveSize, savedDpn: tt.drivesPerNode }
+            }),
+            title: `Set this tier's drive size & drives/node to its chassis (${favForTier.name}): ${d1(favForTier.driveSize)} TB \xD7 ${favForTier.drivesPerNode}. Your original values are kept and can be restored.`,
+            style: { background: C.panel2, color: C.accent, border: `1px solid ${C.accent}55`, borderRadius: 6, padding: "4px 10px", fontSize: 11.5, fontWeight: 600, fontFamily: "ui-monospace, monospace" }
+          },
+          "\u21A7 Pull from tier chassis"
+        ), hasSaved && /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            onClick: () => updateTier(i, { driveSize: tt.savedDrive, drivesPerNode: tt.savedDpn, savedDrive: null, savedDpn: null }),
+            title: "Restore the drive size & drives/node you had before pulling from a chassis.",
+            style: { background: "transparent", color: C.dim, border: `1px solid ${C.line}`, borderRadius: 6, padding: "4px 10px", fontSize: 11.5, fontWeight: 600, fontFamily: "ui-monospace, monospace" }
+          },
+          "\u21BA Revert to my values (",
+          d1(tt.savedDrive),
+          " \xD7 ",
+          tt.savedDpn,
+          ")"
+        ), mism && /* @__PURE__ */ React.createElement(Tip, { text: `This tier assumes ${d1(tt.driveSize)} TB \xD7 ${tt.drivesPerNode} drives/node, but its chassis (${favForTier.name}) is ${d1(favForTier.driveSize)} TB \xD7 ${favForTier.drivesPerNode}. The Chassis & Performance tables use the chassis spec \u2014 not these tier values \u2014 which is why their per-node drive counts can differ.` }, /* @__PURE__ */ React.createElement("span", { style: { color: C.amber, fontSize: 11.5, fontWeight: 700 } }, "\u26A0 differs from chassis")));
+      })(),
+      /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 } }, /* @__PURE__ */ React.createElement(Field, { label: "OSD drive size (TB)", tip: "Tier's ASSUMED drive size for the Results sizing math. The Chassis & Performance tables use each real server's own drive size instead." }, /* @__PURE__ */ React.createElement(
+        Num,
+        {
+          value: tt.driveSize,
+          step: 0.1,
+          onChange: (v) => updateTier(i, { driveSize: v })
+        }
+      )), /* @__PURE__ */ React.createElement(Field, { label: "Drives / node", tip: "Tier's ASSUMED bays per node for the Results math. Chassis & Performance tables use the real server's bay count (e.g. R760xd2 = 24), which is why their Total HDDs can differ." }, /* @__PURE__ */ React.createElement(
+        Num,
+        {
+          value: tt.drivesPerNode,
+          onChange: (v) => updateTier(i, { drivesPerNode: v })
+        }
+      )), /* @__PURE__ */ React.createElement(Field, { label: "CPU cores / OSD" }, /* @__PURE__ */ React.createElement(
+        Num,
+        {
+          value: tt.coresPerOSD,
+          step: 0.5,
+          onChange: (v) => updateTier(i, { coresPerOSD: v })
+        }
+      )), /* @__PURE__ */ React.createElement(Field, { label: "RAM / OSD (GB)" }, /* @__PURE__ */ React.createElement(
+        Num,
+        {
+          value: tt.ramPerOSD,
+          onChange: (v) => updateTier(i, { ramPerOSD: v })
+        }
+      )), /* @__PURE__ */ React.createElement(
+        Field,
+        {
+          label: "DB/WAL frac of raw",
+          tip: "NVMe DB/WAL as a fraction of raw (0.02 HDD, 0 NVMe)."
+        },
+        /* @__PURE__ */ React.createElement(
+          Num,
+          {
+            value: tt.dbwalFraction,
+            step: 5e-3,
+            onChange: (v) => updateTier(i, { dbwalFraction: v })
+          }
+        )
+      ), /* @__PURE__ */ React.createElement(Field, { label: "Front-end (GB/s)" }, /* @__PURE__ */ React.createElement(
+        Num,
+        {
+          value: tt.frontEnd,
+          step: 0.5,
+          onChange: (v) => updateTier(i, { frontEnd: v })
+        }
+      ))),
+      /* @__PURE__ */ React.createElement(
+        Field,
+        {
+          label: `Back-end east-west \xD7: ${tt.eastWest}`,
+          tip: "Recovery-heavy default \xD73. Back-end req = front-end \xD7 this."
+        },
+        /* @__PURE__ */ React.createElement(
+          "input",
+          {
+            type: "range",
+            min: 2,
+            max: 3,
+            step: 0.1,
+            value: tt.eastWest,
+            onChange: (e) => updateTier(i, { eastWest: parseFloat(e.target.value) }),
+            style: { width: "100%" }
+          }
+        )
+      ),
+      /* @__PURE__ */ React.createElement("div", { style: { borderTop: `1px solid ${C.line}`, margin: "6px 0 10px" } }),
+      /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 8, fontFamily: "ui-monospace, monospace" } }, "RECONCILIATION INPUTS"),
+      /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 } }, /* @__PURE__ */ React.createElement(Field, { label: "Failure-domain level" }, /* @__PURE__ */ React.createElement(
+        "select",
+        {
+          value: tt.domainLevel,
+          onChange: (e) => updateTier(i, { domainLevel: e.target.value }),
+          style: inputStyle
+        },
+        /* @__PURE__ */ React.createElement("option", null, "host"),
+        /* @__PURE__ */ React.createElement("option", null, "rack"),
+        /* @__PURE__ */ React.createElement("option", null, "room"),
+        /* @__PURE__ */ React.createElement("option", null, "datacenter")
+      )), /* @__PURE__ */ React.createElement(Field, { label: "Domains available" }, /* @__PURE__ */ React.createElement(
+        Num,
+        {
+          value: tt.domainsAvailable,
+          onChange: (v) => updateTier(i, { domainsAvailable: v })
+        }
+      )), /* @__PURE__ */ React.createElement(Field, { label: "Failures to survive" }, /* @__PURE__ */ React.createElement(
+        Num,
+        {
+          value: tt.failuresToSurvive,
+          onChange: (v) => updateTier(i, { failuresToSurvive: v })
+        }
+      )), /* @__PURE__ */ React.createElement(Field, { label: "Back-end avail (GB/s)" }, /* @__PURE__ */ React.createElement(
+        Num,
+        {
+          value: tt.backendAvailable,
+          step: 0.5,
+          onChange: (v) => updateTier(i, { backendAvailable: v })
+        }
+      )))
+    );
+  })), /* @__PURE__ */ React.createElement("div", null, tiers.map((tt, i) => {
+    if (i !== st) return null;
+    const r = results[i];
+    const checks = reconChecks(tt, r);
+    return /* @__PURE__ */ React.createElement(
+      Card,
+      {
+        key: i,
+        title: `Results \xB7 ${tt.name}`,
+        accent: r.usableMet ? C.green : C.red,
+        num: 3,
+        id: "sec-results",
+        desc: "Computed nodes, OSDs, CPU, RAM and the architecture checks for the selected tier.",
+        right: /* @__PURE__ */ React.createElement(Badge, { tone: r.usableMet ? "green" : "red" }, r.usableMet ? "YES" : "NO \u2014 add nodes")
+      },
+      /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 20px" } }, /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Total raw capacity you must buy = usable target \xD7 the scheme's raw multiplier \xF7 target fullness." }, "Raw required (TB)"), v: d1(r.rawRequired) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Raw required turned into whole drives, rounded up: raw \xF7 drive size." }, "Drives required"), v: n0(r.drivesRequired) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Those drives spread across nodes, rounded up: drives \xF7 drives per node." }, "Nodes (capacity)"), v: n0(r.nodesCapacity) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Fewest nodes that still let the cluster rebuild after losing one: protection width + 1." }, "Self-heal min nodes"), v: n0(r.selfHealMin) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "The larger of the two: nodes needed for capacity, or the self-heal minimum." }, "Nodes (final)"), v: n0(r.nodesFinal), tone: C.accent }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "One OSD per drive across every final node: final nodes \xD7 drives per node." }, "Provisioned OSDs"), v: n0(r.provDrives) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Actual raw capacity you end up with: provisioned drives \xD7 drive size." }, "Provisioned raw (TB)"), v: d1(r.provRaw) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Usable capacity actually delivered: provisioned raw \xD7 fullness \xF7 raw multiplier." }, "Provisioned usable (TB)"), v: d1(r.provUsable), tone: r.usableMet ? C.green : C.red }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Total CPU cores across the cluster, rounded up: OSDs \xD7 cores per OSD." }, "CPU cores"), v: n0(r.cpuCores) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Total memory across the cluster: OSDs \xD7 RAM per OSD." }, "RAM (GB)"), v: n0(r.ramGB) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "NVMe set aside for RocksDB / write-ahead log: provisioned raw \xD7 DB/WAL fraction." }, "DB/WAL NVMe (TB)"), v: d1(r.dbwalTB) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Required back-end (east-west) bandwidth: front-end throughput \xD7 east-west multiplier." }, "Back-end req (GB/s)"), v: d1(r.backendRequired) })),
+      /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, borderTop: `1px solid ${C.line}`, paddingTop: 10 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 8 } }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, "ARCHITECTURE RECONCILIATION"), tt._fixUndo && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => updateTier(i, { ...tt._fixUndo, _fixUndo: null, _fixLabel: null }),
+          title: `Restore the value(s) changed by the last Fix: ${tt._fixLabel}`,
+          style: { background: "transparent", color: C.dim, border: `1px solid ${C.line}`, borderRadius: 5, padding: "2px 8px", fontSize: 10.5, fontWeight: 600, fontFamily: "ui-monospace, monospace", whiteSpace: "nowrap" }
+        },
+        "\u21BA Undo fix (",
+        tt._fixLabel,
+        ")"
+      )), checks.map((c, j) => /* @__PURE__ */ React.createElement("div", { key: j, style: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "3px 0", fontSize: 12.5, fontFamily: "ui-monospace, monospace" } }, /* @__PURE__ */ React.createElement("span", { style: { color: C.dim } }, /* @__PURE__ */ React.createElement(Tip, { text: c.tip }, c.label)), c.ok ? /* @__PURE__ */ React.createElement(Badge, { tone: "green" }, "OK") : /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 6 } }, c.fix && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => {
+            const undo = {};
+            Object.keys(c.fix.patch).forEach((k) => {
+              undo[k] = tt[k];
+            });
+            const label = Object.keys(c.fix.patch).map((k) => `${FIELD_NAMES[k] || k} ${undo[k]} \u2192 ${c.fix.patch[k]}`).join(", ");
+            updateTier(i, { ...c.fix.patch, _fixUndo: undo, _fixLabel: label });
+          },
+          title: c.fix.text,
+          style: { background: "transparent", color: C.accent, border: `1px solid ${C.accent}66`, borderRadius: 5, padding: "2px 8px", fontSize: 11, fontWeight: 700, fontFamily: "ui-monospace, monospace", whiteSpace: "nowrap" }
+        },
+        "Fix"
+      ), /* @__PURE__ */ React.createElement(Badge, { tone: "red" }, c.msg)))))
+    );
+  }), /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Cluster Totals",
+      accent: C.amber,
+      scope: { kind: "cluster" },
+      num: 4,
+      id: "sec-totals",
+      desc: "Everything above added up across all tiers \u2014 the full cluster spec.",
+      right: /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, "summed across all tiers")
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 10, fontFamily: "ui-monospace, monospace" } }, "Every value below adds up all ", tiers.length, " tier", tiers.length > 1 ? "s" : "", " \xB7 hover any label for its formula"),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 20px" } }, /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Sum over all tiers of each tier's final node count (Nodes = max of capacity vs self-heal floor)." }, "Total storage nodes"), v: n0(totals.nodes), tone: C.accent }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Sum over all tiers of OSDs (per tier: nodes \xD7 drives-per-node). One OSD per drive." }, "Total OSDs"), v: n0(totals.osds) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Sum over all tiers of CPU cores (rounded up per tier): OSDs \xD7 cores per OSD." }, "Total CPU cores"), v: n0(totals.cores) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Sum over all tiers of OSDs \xD7 RAM-per-OSD (GB)." }, "Total RAM (GB)"), v: n0(totals.ram) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Sum over all tiers of provisioned raw = nodes \xD7 drives-per-node \xD7 drive-size." }, "Total raw (TB)"), v: d1(totals.raw) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Sum over all tiers of provisioned usable = raw \xD7 fullness \xF7 multiplier." }, "Total usable (TB)"), v: d1(totals.usable), tone: C.green }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Sum over all tiers of NVMe set aside for RocksDB / write-ahead log: provisioned raw \xD7 DB/WAL fraction." }, "Total DB/WAL NVMe (TB)"), v: d1(totals.dbwal) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "Sum over all tiers of back-end requirement = front-end \xD7 east-west multiplier." }, "Aggregate back-end (GB/s)"), v: d1(totals.backend) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "2 ports per node (1 public + 1 cluster) \xD7 total nodes across all tiers." }, "Public = cluster ports"), v: n0(totals.ports) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "25/100 GbE when aggregate back-end > 15 GB/s, otherwise 25 GbE." }, "Recommended link"), v: totals.link, tone: C.amber })),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("button", { onClick: exportCSV, style: btn(C.accent) }, "Export sizing (CSV)"), /* @__PURE__ */ React.createElement("button", { onClick: printSummary, style: btn(C.dim) }, "Printable summary"), /* @__PURE__ */ React.createElement("button", { onClick: () => snapshot("A"), style: btn(C.green) }, "Snapshot \u2192 A"), /* @__PURE__ */ React.createElement("button", { onClick: () => snapshot("B"), style: btn(C.amber) }, "Snapshot \u2192 B"), /* @__PURE__ */ React.createElement("button", { onClick: exportConfig, style: btn(C.accent) }, "Save config (JSON)"), /* @__PURE__ */ React.createElement("label", { style: { ...btn(C.dim), display: "inline-block" } }, "Load config", /* @__PURE__ */ React.createElement("input", { type: "file", accept: "application/json,.json", onChange: importConfig, style: { display: "none" } })))
+  ), (snapA || snapB) && /* @__PURE__ */ React.createElement(Card, { title: "Scenario A / B Compare", scope: { kind: "cluster" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, fontSize: 12.5, fontFamily: "ui-monospace, monospace" } }, /* @__PURE__ */ React.createElement("div", { style: { color: C.faint } }, "Metric"), /* @__PURE__ */ React.createElement("div", { style: { color: C.green, fontWeight: 700 } }, "Scenario A"), /* @__PURE__ */ React.createElement("div", { style: { color: C.amber, fontWeight: 700 } }, "Scenario B"), [
+    ["Nodes", "nodes", n0],
+    ["OSDs", "osds", n0],
+    ["Cores", "cores", n0],
+    ["RAM GB", "ram", n0],
+    ["Raw TB", "raw", d1],
+    ["Usable TB", "usable", d1],
+    ["Back-end GB/s", "backend", d1]
+  ].map(([lbl, key, fmt]) => /* @__PURE__ */ React.createElement(React.Fragment, { key }, /* @__PURE__ */ React.createElement("div", { style: { color: C.dim } }, lbl), /* @__PURE__ */ React.createElement("div", null, snapA ? fmt(snapA.totals[key]) : "\u2014"), /* @__PURE__ */ React.createElement("div", null, snapB ? fmt(snapB.totals[key]) : "\u2014"))))))), /* @__PURE__ */ React.createElement(
+    ChassisSection,
+    {
+      chassis,
+      updateChassis,
+      addChassis,
+      removeChassis,
+      updateTier,
+      tiers,
+      selTier: st,
+      setSelTier
+    }
+  ), /* @__PURE__ */ React.createElement(TopologySection, { chassis, tiers, selTier: st, assum, updateTier }), /* @__PURE__ */ React.createElement(RackNetworkSection, { chassis, tiers, selTier: st, assum, setAssum }), /* @__PURE__ */ React.createElement(NetworkSection, { chassis, tiers, selTier: st, assum }), /* @__PURE__ */ React.createElement(TcoSection, { chassis, tiers, selTier: st, assum, setAssum }), /* @__PURE__ */ React.createElement(CrossoverSection, { chassis, tiers, selTier: st, assum }), /* @__PURE__ */ React.createElement(PowerSection, { chassis, tiers, selTier: st, assum, setAssum }), /* @__PURE__ */ React.createElement(OverheadSection, { tiers, results, selTier: st }), /* @__PURE__ */ React.createElement(RebuildSection, { chassis, tiers, selTier: st, assum, setAssum }), /* @__PURE__ */ React.createElement(FailureSimSection, { chassis, tiers, selTier: st }), /* @__PURE__ */ React.createElement(GrowthSection, { tiers, results, selTier: st, updateTier }), /* @__PURE__ */ React.createElement(BomSection, { chassis, tiers, selTier: st, assum, setAssum }), /* @__PURE__ */ React.createElement(ClusterRollupSection, { chassis, tiers, assum }), /* @__PURE__ */ React.createElement(PerfSection, { perf, setPerf, chassis }));
+}
+var btn = (color) => ({
+  background: "transparent",
+  color,
+  border: `1px solid ${color}66`,
+  borderRadius: 6,
+  padding: "7px 12px",
+  fontSize: 12.5,
+  fontWeight: 600,
+  fontFamily: "ui-monospace, monospace"
+});
+var CHASSIS_COL_HELP = {
+  "U": "Rack height of one server, in rack units.",
+  "Drive TB": "Capacity of a single drive in this server.",
+  "Drives/node": "Number of drive bays used per server.",
+  "Cores": "CPU cores per server.",
+  "RAM": "Memory per server, in GB.",
+  "Net Gb": "Network bandwidth per server, in Gb/s.",
+  "Price \u20AC": "Purchase price of one server.",
+  "Raw/node": "Raw capacity of one server: drive size \xD7 drives per node.",
+  "Nodes": "Servers needed to build the selected tier \u2014 the larger of the capacity need and the self-heal minimum (protection width + 1). Hover the value for its cap / floor breakdown.",
+  "Agg raw": "Total raw capacity across all servers: nodes \xD7 raw per node.",
+  "Agg OSDs": "Total OSDs (one per drive) across all servers: nodes \xD7 drives per node.",
+  "Rack-U": "Total rack space used: nodes \xD7 server height in U.",
+  "\u20AC/raw-TB": "Cost efficiency: server price \xF7 raw capacity per server. Lower is cheaper per raw TB."
+};
+function ChassisSection({ chassis, updateChassis, addChassis, removeChassis, updateTier, tiers, selTier, setSelTier }) {
+  const t = tiers[selTier] || tiers[0];
+  const rows = chassis.map((c) => ({ c, r: chassisForTier(c, t) }));
+  const chartData = rows.map(({ c, r }) => ({
+    name: c.name.split(" ")[1] || c.name,
+    nodes: r.nodes,
+    osds: r.aggOSDs,
+    u: r.aggU
+  }));
+  const [cmpTier, setCmpTier] = useState(() => selTier === 0 && tiers.length > 1 ? 1 : 0);
+  const ci = Math.min(cmpTier, tiers.length - 1);
+  const tCmp = tiers[ci] || tiers[0];
+  const chartData2 = chassis.map((c) => {
+    const r = chassisForTier(c, tCmp);
+    return { name: c.name.split(" ")[1] || c.name, nodes: r.nodes, osds: r.aggOSDs, u: r.aggU };
+  });
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Chassis Comparison \xB7 green cells are editable",
+      scope: { kind: "tier", name: t.name },
+      num: 5,
+      id: "sec-chassis",
+      desc: "How many of each server model this tier would need, and cost per raw TB.",
+      right: /* @__PURE__ */ React.createElement("select", { value: selTier, onChange: (e) => setSelTier(parseInt(e.target.value)), style: { ...inputStyle, width: 180 } }, tiers.map((tt, i) => /* @__PURE__ */ React.createElement("option", { key: i, value: i }, tt.name)))
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: C.faint, marginBottom: 10, fontFamily: "ui-monospace, monospace" } }, "Sizing every chassis for tier ", /* @__PURE__ */ React.createElement("span", { style: { color: C.accent, fontWeight: 700 } }, t.name), " \xB7 ", "target ", d1(t.usableTarget), " TB usable \xB7 ", t.scheme, " \xB7 fullness ", t.fullness.toFixed(2), /* @__PURE__ */ React.createElement("span", { style: { color: C.faint } }, " \u2014 switch tier to re-size \u2197"), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 4 } }, "Under each Nodes value: ", /* @__PURE__ */ React.createElement("b", null, "cap"), " = nodes needed for capacity, ", /* @__PURE__ */ React.createElement("b", null, "floor"), " = self-heal minimum (width + 1). The highlighted one wins; \u26E8 means the floor raised the count above capacity.")),
+    /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto" } }, /* @__PURE__ */ React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12.5, fontFamily: "ui-monospace, monospace" } }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { style: { color: C.dim, textAlign: "right", borderBottom: `1px solid ${C.line}` } }, ["Chassis", "U", "Drive TB", "Drives/node", "Cores", "RAM", "Net Gb", "Price \u20AC", "Raw/node", "Nodes", "Agg raw", "Agg OSDs", "Rack-U", "\u20AC/raw-TB"].map((h, i) => /* @__PURE__ */ React.createElement("th", { key: h, style: { padding: "8px 10px", textAlign: i === 0 ? "left" : "right", fontWeight: 600 } }, CHASSIS_COL_HELP[h] ? /* @__PURE__ */ React.createElement(Tip, { below: true, alignRight: i >= 10, text: CHASSIS_COL_HELP[h] }, h) : h)))), /* @__PURE__ */ React.createElement("tbody", null, rows.map(({ c, r }) => {
+      const isTierChassis = c.id === t.chassisId;
+      return /* @__PURE__ */ React.createElement("tr", { key: c.id, style: { borderBottom: `1px solid ${C.panel2}`, background: isTierChassis ? "rgba(56,189,248,.05)" : "transparent" } }, /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", minWidth: 240 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 6 } }, /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          title: `Use this chassis for ${t.name}`,
+          onClick: () => updateTier(selTier, { chassisId: c.id }),
+          style: { background: "transparent", border: "none", color: isTierChassis ? C.accent : C.faint, fontSize: 16, lineHeight: 1, padding: 0, width: 18 }
+        },
+        isTierChassis ? "\u2605" : "\u2606"
+      ), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          value: c.name,
+          onChange: (e) => updateChassis(c.id, { name: e.target.value }),
+          style: {
+            flex: 1,
+            minWidth: 120,
+            textAlign: "left",
+            background: C.edit,
+            border: `1px solid ${C.editLine}`,
+            color: isTierChassis ? C.accent : "#7ee2a8",
+            fontWeight: isTierChassis ? 700 : 400,
+            borderRadius: 4,
+            padding: "3px 6px",
+            fontSize: 12,
+            fontFamily: "ui-monospace, monospace"
+          }
+        }
+      ), chassis.length > 1 && /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          title: "Remove chassis",
+          onClick: () => removeChassis(c.id),
+          style: { background: "transparent", color: C.red, border: `1px solid ${C.red}55`, borderRadius: 4, width: 22, height: 24, fontSize: 13, lineHeight: 1 }
+        },
+        "\xD7"
+      ))), [["u", 1], ["driveSize", 0.1], ["drivesPerNode", 1], ["cores", 1], ["ram", 1], ["netGb", 1], ["price", 500]].map(([f, step]) => /* @__PURE__ */ React.createElement("td", { key: f, style: { padding: "3px 4px" } }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "number",
+          value: c[f],
+          step,
+          onChange: (e) => updateChassis(c.id, { [f]: parseFloat(e.target.value) }),
+          style: {
+            width: f === "price" ? 76 : 56,
+            textAlign: "right",
+            background: C.edit,
+            border: `1px solid ${C.editLine}`,
+            color: "#7ee2a8",
+            borderRadius: 4,
+            padding: "3px 5px",
+            fontSize: 12,
+            fontFamily: "ui-monospace, monospace"
+          }
+        }
+      ))), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, d1(r.rawPerNode)), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", textAlign: "right", verticalAlign: "top" } }, /* @__PURE__ */ React.createElement("div", { style: { color: C.accent, fontWeight: 700 } }, n0(r.nodes), !r.capacityBound && /* @__PURE__ */ React.createElement("span", { style: { color: C.green } }, " \u26E8")), /* @__PURE__ */ React.createElement(Tip, { text: r.capacityBound ? `Set by capacity: needs ${r.nodesCapacity} nodes, above the self-heal floor of ${r.selfHealMin} (width + 1).` : `Raised to self-heal floor: width + 1 = ${r.selfHealMin}. Capacity alone would need only ${r.nodesCapacity}.` }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10.5, whiteSpace: "nowrap" } }, /* @__PURE__ */ React.createElement("span", { style: { color: r.capacityBound ? C.ink : C.faint, fontWeight: r.capacityBound ? 700 : 400 } }, "cap ", n0(r.nodesCapacity)), /* @__PURE__ */ React.createElement("span", { style: { color: C.faint } }, " \xB7 "), /* @__PURE__ */ React.createElement("span", { style: { color: r.capacityBound ? C.faint : C.green, fontWeight: r.capacityBound ? 400 : 700 } }, "floor ", n0(r.selfHealMin))))), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, d1(r.aggRaw)), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, n0(r.aggOSDs)), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", textAlign: "right" } }, n0(r.aggU)), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", textAlign: "right", color: C.amber } }, "\u20AC", n0(r.eurPerRawTB)));
+    })))),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12 } }, /* @__PURE__ */ React.createElement("button", { onClick: addChassis, style: {
+      background: C.panel2,
+      color: C.accent,
+      border: `1px solid ${C.accent}55`,
+      borderRadius: 6,
+      padding: "6px 12px",
+      fontSize: 13,
+      fontWeight: 600
+    } }, "+ Add chassis"), /* @__PURE__ */ React.createElement("span", { style: { marginLeft: 10, fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, "\u2605 = chassis used by ", /* @__PURE__ */ React.createElement("b", { style: { color: C.accent } }, t.name), " (click a \u2606 to assign) \xB7 drives its cost, power, rack & network sections")),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }, className: "split" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 6, fontFamily: "ui-monospace, monospace" } }, "NODES / OSDs / RACK-U PER CHASSIS \xB7 ", /* @__PURE__ */ React.createElement("span", { style: { color: C.accent, fontWeight: 700 } }, t.name)), /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 220 }, /* @__PURE__ */ React.createElement(BarChart, { data: chartData }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: C.line, strokeDasharray: "3 3" }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "name", tick: { fill: C.dim, fontSize: 11 } }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: C.dim, fontSize: 11 } }), /* @__PURE__ */ React.createElement(RTooltip, { contentStyle: { background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 6, color: C.ink } }), /* @__PURE__ */ React.createElement(Legend, { wrapperStyle: { fontSize: 11 } }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "nodes", fill: C.accent, name: "Nodes" }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "osds", fill: C.green, name: "OSDs" }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "u", fill: C.amber, name: "Rack-U" })))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 6, fontFamily: "ui-monospace, monospace", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", null, "NODES / OSDs / RACK-U PER CHASSIS \xB7 compare"), /* @__PURE__ */ React.createElement(
+      "select",
+      {
+        value: ci,
+        onChange: (e) => setCmpTier(parseInt(e.target.value)),
+        style: { ...inputStyle, width: 150, padding: "3px 6px", fontSize: 11 }
+      },
+      tiers.map((tt, i) => /* @__PURE__ */ React.createElement("option", { key: i, value: i }, tt.name))
+    )), /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 220 }, /* @__PURE__ */ React.createElement(BarChart, { data: chartData2 }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: C.line, strokeDasharray: "3 3" }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "name", tick: { fill: C.dim, fontSize: 11 } }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: C.dim, fontSize: 11 } }), /* @__PURE__ */ React.createElement(RTooltip, { contentStyle: { background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 6, color: C.ink } }), /* @__PURE__ */ React.createElement(Legend, { wrapperStyle: { fontSize: 11 } }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "nodes", fill: C.accent, name: "Nodes" }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "osds", fill: C.green, name: "OSDs" }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "u", fill: C.amber, name: "Rack-U" })))))
+  );
+}
+function TcoSection({ chassis, tiers, selTier, assum, setAssum }) {
+  const t = tiers[selTier] || tiers[0];
+  const favC = chassisFor(t, chassis);
+  const rawPerNode = favC.driveSize * favC.drivesPerNode;
+  const cost = assum;
+  const setC = (k, v) => setAssum((p) => ({ ...p, [k]: v }));
+  const data = SCHEME_KEYS.map((k) => {
+    const s = SCHEMES[k];
+    const ec = k.startsWith("EC");
+    const nodesCap = roundUp(t.usableTarget * s.mult / t.fullness / rawPerNode);
+    const nodes = Math.max(nodesCap, s.width + 1);
+    const usable = nodes * rawPerNode * t.fullness / s.mult;
+    const servers = nodes * favC.price;
+    const cpu = ec ? servers * (cost.ecCpuPct / 100) : 0;
+    const net = nodes * 2 * cost.portCost * (ec ? cost.ecNetFactor : 1);
+    const total = servers + cpu + net;
+    return {
+      name: k,
+      nodes,
+      usable: Math.round(usable),
+      Servers: +(servers / 1e3).toFixed(1),
+      "CPU (EC)": +(cpu / 1e3).toFixed(1),
+      Network: +(net / 1e3).toFixed(1),
+      total: Math.round(total),
+      eurReq: Math.round(total / t.usableTarget),
+      // € per TB you actually asked for
+      floored: nodesCap < s.width + 1
+    };
+  });
+  const cheapest = data.reduce((a, b) => b.eurReq < a.eurReq ? b : a, data[0]);
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Total Cost of Ownership by scheme \xB7 scheme-aware (favoured chassis)",
+      accent: C.green,
+      scope: { kind: "tier", name: t.name },
+      num: 9,
+      id: "sec-tco",
+      desc: "What each protection scheme costs to build for this tier \u2014 servers, CPU, network, switches, racks.",
+      right: /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, favC.name.split(" ")[1] || favC.name, " \xB7 ", t.name, " \xB7 ", d1(t.usableTarget), " TB target")
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 8, fontFamily: "ui-monospace, monospace" } }, "COST ASSUMPTIONS \xB7 green cells are editable"),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(3, minmax(140px,1fr))", gap: 12, marginBottom: 14, maxWidth: 560 } }, /* @__PURE__ */ React.createElement(Field, { label: "\u20AC / switch port", tip: "Cost per network port. Model uses 2 ports per node (public + cluster)." }, /* @__PURE__ */ React.createElement(GreenNum, { value: cost.portCost, step: 50, onChange: (v) => setC("portCost", v) })), /* @__PURE__ */ React.createElement(Field, { label: "EC CPU premium %", tip: "Extra server cost for stronger CPUs to run EC parity encode/decode. Applied to EC schemes only." }, /* @__PURE__ */ React.createElement(GreenNum, { value: cost.ecCpuPct, step: 1, onChange: (v) => setC("ecCpuPct", v) })), /* @__PURE__ */ React.createElement(Field, { label: "EC network \xD7", tip: "Cluster-network uplift for EC recovery traffic (rebuild reads k chunks from peers). Applied to EC schemes only." }, /* @__PURE__ */ React.createElement(GreenNum, { value: cost.ecNetFactor, step: 0.1, onChange: (v) => setC("ecNetFactor", v) }))),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }, className: "split" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 6, fontFamily: "ui-monospace, monospace" } }, "TOTAL BUILD COST (\u20AC thousands) \u2014 servers + EC CPU + network, stacked"), /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 250 }, /* @__PURE__ */ React.createElement(BarChart, { data }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: C.line, strokeDasharray: "3 3" }), /* @__PURE__ */ React.createElement(
+      XAxis,
+      {
+        dataKey: "name",
+        tick: { fill: C.dim, fontSize: 10 },
+        angle: -12,
+        textAnchor: "end",
+        height: 50,
+        tickFormatter: (v) => v === t.scheme ? v + " \u2605" : v
+      }
+    ), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: C.dim, fontSize: 11 } }), /* @__PURE__ */ React.createElement(
+      RTooltip,
+      {
+        cursor: { fill: "rgba(255,255,255,0.06)" },
+        contentStyle: { background: "#0b0f14", border: `1px solid ${C.line}`, borderRadius: 6 },
+        labelStyle: { color: C.ink, fontWeight: 700 }
+      }
+    ), /* @__PURE__ */ React.createElement(Legend, { wrapperStyle: { fontSize: 11 } }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "Servers", stackId: "a", fill: C.accent }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "CPU (EC)", stackId: "a", fill: C.amber }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "Network", stackId: "a", fill: C.green })))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 6, fontFamily: "ui-monospace, monospace" } }, "\u20AC PER ", /* @__PURE__ */ React.createElement("b", null, "REQUIRED"), " USABLE-TB \u2014 real nodes incl. self-heal floor + EC premiums"), /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 250 }, /* @__PURE__ */ React.createElement(BarChart, { data }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: C.line, strokeDasharray: "3 3" }), /* @__PURE__ */ React.createElement(
+      XAxis,
+      {
+        dataKey: "name",
+        tick: { fill: C.dim, fontSize: 10 },
+        angle: -12,
+        textAnchor: "end",
+        height: 50,
+        tickFormatter: (v) => v === t.scheme ? v + " \u2605" : v
+      }
+    ), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: C.dim, fontSize: 11 } }), /* @__PURE__ */ React.createElement(
+      RTooltip,
+      {
+        cursor: { fill: "rgba(255,255,255,0.06)" },
+        contentStyle: { background: "#0b0f14", border: `1px solid ${C.line}`, borderRadius: 6 },
+        labelStyle: { color: C.ink, fontWeight: 700 },
+        itemStyle: { color: C.ink }
+      }
+    ), /* @__PURE__ */ React.createElement(Bar, { dataKey: "eurReq", name: "\u20AC/required-TB", radius: [3, 3, 0, 0] }, data.map((d, i) => /* @__PURE__ */ React.createElement(
+      Cell,
+      {
+        key: i,
+        fill: d.name === cheapest.name ? C.green : C.dim,
+        stroke: d.name === t.scheme ? C.ink : "none",
+        strokeWidth: d.name === t.scheme ? 2 : 0
+      }
+    ))))))),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, /* @__PURE__ */ React.createElement("b", { style: { color: C.green } }, "Green"), " = cheapest option for this target \xB7 ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, "outlined + \u2605"), " = this tier's currently selected scheme (", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, t.scheme), ")", t.scheme === "Custom EC" ? " \u2014 a custom k+m profile, not shown among the presets here" : "", ". So the two are separate signals: green tells you the cheapest preset, the outline tells you where your choice sits. Node counts use the same capacity-vs-self-heal-floor rule as the tables \u2014 at small targets EC's high floor shows up as expensive near-empty nodes, and green shifts to EC only once capacity dominates. \u20AC/required-TB = total cost \xF7 the usable TB you asked for. CPU & network premiums above are editable assumptions, applied to EC schemes only.")
+  );
+}
+var SCHEME_COLORS = {
+  "Replication \xD72": "#f472b6",
+  "Replication \xD73": "#38bdf8",
+  "EC 2+2": "#a78bfa",
+  "EC 4+2": "#22c55e",
+  "EC 8+3": "#f59e0b",
+  "EC 8+4": "#ef4444"
+};
+function CrossoverSection({ chassis, tiers, selTier, assum }) {
+  const t = tiers[selTier] || tiers[0];
+  const favC = chassisFor(t, chassis);
+  const lo = 50, hi = 2e4, n = 26;
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    const target = Math.round(lo * Math.pow(hi / lo, i / (n - 1)));
+    const row = { target };
+    SCHEME_KEYS.forEach((k) => {
+      const r = sizeScheme(favC, SCHEMES[k], k.startsWith("EC"), target, t.fullness, assum);
+      row[k] = Math.round(r.capex / target);
+    });
+    pts.push(row);
+  }
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Cost vs capacity \xB7 where EC overtakes replication (favoured chassis)",
+      accent: C.accent,
+      scope: { kind: "tier", name: t.name },
+      num: 10,
+      id: "sec-crossover",
+      desc: "At what data volume erasure coding becomes cheaper per usable TB than replication.",
+      right: /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, favC.name.split(" ")[1] || favC.name, " \xB7 fullness ", t.fullness.toFixed(2))
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 6, fontFamily: "ui-monospace, monospace" } }, "\u20AC PER REQUIRED USABLE-TB vs TARGET (log\u2013log) \xB7 capex incl. EC CPU/network, real nodes with self-heal floor"),
+    /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 300 }, /* @__PURE__ */ React.createElement(LineChart, { data: pts, margin: { top: 8, right: 24, bottom: 16, left: 4 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: C.line, strokeDasharray: "3 3" }), /* @__PURE__ */ React.createElement(
+      XAxis,
+      {
+        dataKey: "target",
+        type: "number",
+        scale: "log",
+        domain: ["auto", "auto"],
+        tick: { fill: C.dim, fontSize: 10 },
+        tickFormatter: (v) => v >= 1e3 ? v / 1e3 + "k" : v,
+        label: { value: "usable target (TB)", position: "insideBottom", offset: -6, fill: C.faint, fontSize: 10 }
+      }
+    ), /* @__PURE__ */ React.createElement(
+      YAxis,
+      {
+        type: "number",
+        scale: "log",
+        domain: ["auto", "auto"],
+        width: 48,
+        tick: { fill: C.dim, fontSize: 10 },
+        tickFormatter: (v) => "\u20AC" + v
+      }
+    ), /* @__PURE__ */ React.createElement(
+      RTooltip,
+      {
+        contentStyle: { background: "#0b0f14", border: `1px solid ${C.line}`, borderRadius: 6 },
+        labelStyle: { color: C.ink, fontWeight: 700 },
+        itemStyle: { color: C.ink },
+        labelFormatter: (v) => `target ${n0(v)} TB`,
+        formatter: (v, k) => ["\u20AC" + v + "/TB", k]
+      }
+    ), /* @__PURE__ */ React.createElement(Legend, { wrapperStyle: { fontSize: 10 } }), SCHEME_KEYS.map((k) => /* @__PURE__ */ React.createElement(
+      Line,
+      {
+        key: k,
+        type: "monotone",
+        dataKey: k,
+        stroke: SCHEME_COLORS[k],
+        dot: false,
+        strokeWidth: k === t.scheme ? 3.5 : 1.5
+      }
+    )))),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, "Each line is a protection scheme; lower = cheaper per TB you actually need. At small targets replication wins (EC's high node floor buys near-empty servers); as the target grows the EC lines dive under replication \u2014 that crossover is the scale where EC starts paying off. Your tier's selected scheme (", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, t.scheme), ") is drawn thick.")
+  );
+}
+function PowerSection({ chassis, tiers, selTier, assum, setAssum }) {
+  const t = tiers[selTier] || tiers[0];
+  const favC = chassisFor(t, chassis);
+  const setA = (k, v) => setAssum((p) => ({ ...p, [k]: v }));
+  const u = Math.max(1, favC.u);
+  const uPerRack = Math.max(u, Math.round(assum.uPerRack));
+  const nodesPerRack = Math.max(1, Math.floor(uPerRack / u));
+  const portsPerSwitch = Math.max(1, Math.round(assum.portsPerSwitch));
+  const data = SCHEME_KEYS.map((k) => {
+    const r = sizeScheme(favC, SCHEMES[k], k.startsWith("EC"), t.usableTarget, t.fullness, assum);
+    const switches = 2 * Math.max(1, Math.ceil(r.nodes / portsPerSwitch));
+    const racks = Math.max(1, Math.ceil(r.nodes / nodesPerRack));
+    const capex = r.capex + switches * assum.switchPrice + racks * assum.rackPrice;
+    return {
+      name: k,
+      nodes: r.nodes,
+      powerKw: +r.powerKw.toFixed(1),
+      Capex: +(capex / 1e3).toFixed(1),
+      Energy: +(r.energyYr * assum.years / 1e3).toFixed(1),
+      capexEur: Math.round(capex),
+      energyEur: Math.round(r.energyYr * assum.years),
+      total: Math.round(capex + r.energyYr * assum.years)
+    };
+  });
+  const sel = data.find((d) => d.name === t.scheme);
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: `Power & ${assum.years}-year TCO \xB7 capex + energy (favoured chassis)`,
+      accent: C.amber,
+      scope: { kind: "tier", name: t.name },
+      num: 11,
+      id: "sec-power",
+      desc: "Electricity plus hardware over several years, compared across protection schemes.",
+      right: /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, favC.name.split(" ")[1] || favC.name, " \xB7 ", t.name, " \xB7 ", d1(t.usableTarget), " TB")
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 8, fontFamily: "ui-monospace, monospace" } }, "POWER ASSUMPTIONS \xB7 green cells are editable"),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(4, minmax(120px,1fr))", gap: 12, marginBottom: 12, maxWidth: 720 } }, /* @__PURE__ */ React.createElement(Field, { label: "Watts / node", tip: "Average power draw of one server under load." }, /* @__PURE__ */ React.createElement(GreenNum, { value: assum.wattsPerNode, step: 25, onChange: (v) => setA("wattsPerNode", v) })), /* @__PURE__ */ React.createElement(Field, { label: "PUE", tip: "Power Usage Effectiveness \u2014 datacenter overhead for cooling/power. 1.0 = none, ~1.4 typical." }, /* @__PURE__ */ React.createElement(GreenNum, { value: assum.pue, step: 0.05, onChange: (v) => setA("pue", v) })), /* @__PURE__ */ React.createElement(Field, { label: "\u20AC / kWh", tip: "Electricity price per kilowatt-hour." }, /* @__PURE__ */ React.createElement(GreenNum, { value: assum.eurPerKwh, step: 0.01, onChange: (v) => setA("eurPerKwh", v) })), /* @__PURE__ */ React.createElement(Field, { label: "Years", tip: "TCO horizon in years." }, /* @__PURE__ */ React.createElement(GreenNum, { value: assum.years, step: 1, onChange: (v) => setA("years", v) }))),
+    sel && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: C.dim, marginBottom: 10, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, "Selected scheme ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, t.scheme), ": ", sel.nodes, " nodes \xB7 ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, sel.powerKw, " kW"), " draw (incl. PUE) \xB7 ", /* @__PURE__ */ React.createElement("b", { style: { color: C.amber } }, "\u20AC", n0(sel.total)), " total over ", assum.years, " yr = capex \u20AC", n0(sel.capexEur), " + energy \u20AC", n0(sel.energyEur)),
+    /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 260 }, /* @__PURE__ */ React.createElement(BarChart, { data }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: C.line, strokeDasharray: "3 3" }), /* @__PURE__ */ React.createElement(
+      XAxis,
+      {
+        dataKey: "name",
+        tick: { fill: C.dim, fontSize: 10 },
+        angle: -12,
+        textAnchor: "end",
+        height: 50,
+        tickFormatter: (v) => v === t.scheme ? v + " \u2605" : v
+      }
+    ), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: C.dim, fontSize: 11 } }), /* @__PURE__ */ React.createElement(
+      RTooltip,
+      {
+        cursor: { fill: "rgba(255,255,255,0.06)" },
+        contentStyle: { background: "#0b0f14", border: `1px solid ${C.line}`, borderRadius: 6 },
+        labelStyle: { color: C.ink, fontWeight: 700 }
+      }
+    ), /* @__PURE__ */ React.createElement(Legend, { wrapperStyle: { fontSize: 11 } }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "Capex", stackId: "a", fill: C.accent }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "Energy", stackId: "a", fill: C.amber }))),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, "Bars are \u20AC thousands. Capex = servers + EC CPU + network + switches + racks (same components as BOM & cluster roll-up). Energy = nodes \xD7 watts/node \xD7 PUE \xD7 8760 h \xD7 \u20AC/kWh \xD7 ", assum.years, " yr. Wider EC clusters run more nodes, so they draw more power \u2014 over a long horizon that erodes part of EC's capex advantage.")
+  );
+}
+function OverheadSection({ tiers, results, selTier }) {
+  const COLORS = [C.green, C.amber, C.faint];
+  return /* @__PURE__ */ React.createElement(Card, { title: "Capacity efficiency \xB7 where your raw capacity goes", accent: C.green, scope: { kind: "cluster" }, num: 12, id: "sec-overhead", desc: "How much of the raw disk becomes usable space vs lost to protection and the fullness reserve." }, /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 } }, tiers.map((tt, i) => {
+    const r = results[i];
+    const usable = r.provUsable;
+    const fres = r.provRaw * (1 - r.fullness);
+    const prot = Math.max(0, r.provRaw - usable - fres);
+    const data = [
+      { name: "Usable", value: +usable.toFixed(1) },
+      { name: "Protection overhead", value: +prot.toFixed(1) },
+      { name: "Fullness reserve", value: +fres.toFixed(1) }
+    ];
+    const eff = r.provRaw > 0 ? usable / r.provRaw * 100 : 0;
+    return /* @__PURE__ */ React.createElement("div", { key: i, style: { textAlign: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: C.dim, fontFamily: "ui-monospace, monospace", marginBottom: 4 } }, tt.name), /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 190 }, /* @__PURE__ */ React.createElement(PieChart, null, /* @__PURE__ */ React.createElement(Pie, { data, dataKey: "value", nameKey: "name", innerRadius: 44, outerRadius: 70, paddingAngle: 2, stroke: "none" }, data.map((d, j) => /* @__PURE__ */ React.createElement(Cell, { key: j, fill: COLORS[j] }))), /* @__PURE__ */ React.createElement(
+      RTooltip,
+      {
+        contentStyle: { background: "#0b0f14", border: `1px solid ${C.line}`, borderRadius: 6 },
+        labelStyle: { color: C.ink },
+        itemStyle: { color: C.ink },
+        formatter: (v) => d1(v) + " TB"
+      }
+    ))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: C.dim, fontFamily: "ui-monospace, monospace" } }, d1(r.provRaw), " TB raw \u2192 ", /* @__PURE__ */ React.createElement("b", { style: { color: C.green } }, d1(usable), " TB usable"), " \xB7 ", d1(eff), "% efficient"));
+  })), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, /* @__PURE__ */ React.createElement("b", { style: { color: C.green } }, "Usable"), " = what you can store \xB7 ", /* @__PURE__ */ React.createElement("b", { style: { color: C.amber } }, "Protection overhead"), " = extra copies / EC parity \xB7 ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, "Fullness reserve"), " = capacity kept free so the cluster never fills past the target. Efficiency = usable \xF7 raw."));
+}
+function TopologySection({ chassis, tiers, selTier, assum, updateTier }) {
+  const t = tiers[selTier] || tiers[0];
+  const favC = chassisFor(t, chassis);
+  const r = chassisForTier(favC, t);
+  const nodes = r.nodes;
+  const dpn = favC.drivesPerNode;
+  const totalOSDs = nodes * dpn;
+  const u = Math.max(1, favC.u);
+  const uPerRack = Math.max(u, Math.round(assum.uPerRack));
+  const nodesPerRack = Math.max(1, Math.floor(uPerRack / u));
+  const racks = Math.max(1, Math.ceil(nodes / nodesPerRack));
+  const spec = schemeSpec(t);
+  const levels = [
+    { key: "datacenter", label: "Data center" },
+    { key: "room", label: "Room" },
+    { key: "rack", label: "Rack", count: racks },
+    { key: "host", label: "Host (node)", count: nodes, per: `${nodesPerRack} / rack` },
+    { key: "osd", label: "OSD (drive)", count: totalOSDs, per: `${dpn} / host` }
+  ];
+  const box = (idx) => {
+    if (idx >= levels.length) return null;
+    const L = levels[idx];
+    const isDom = L.key === t.domainLevel;
+    const inner = idx < levels.length - 1;
+    return /* @__PURE__ */ React.createElement("div", { style: {
+      border: `1px ${isDom ? "solid" : "dashed"} ${isDom ? C.accent : C.line}`,
+      borderRadius: 8,
+      padding: "8px 10px",
+      background: isDom ? "rgba(56,189,248,.07)" : "transparent"
+    } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: inner ? 8 : 0, gap: 8 } }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 12, color: isDom ? C.accent : C.dim, fontWeight: isDom ? 700 : 600, fontFamily: "ui-monospace, monospace" } }, L.label, L.count != null ? ` \xD7${n0(L.count)}` : "", isDom ? "  \u2190 failure domain" : ""), L.per && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 10.5, color: C.faint, fontFamily: "ui-monospace, monospace" } }, L.per)), box(idx + 1));
+  };
+  const alignTarget = t.domainLevel === "host" ? nodes : null;
+  const misaligned = alignTarget != null && t.domainsAvailable !== alignTarget;
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Topology & failure domains \xB7 how OSD \u2192 host \u2192 rack \u2192 room \u2192 data center nest",
+      accent: C.accent,
+      scope: { kind: "tier", name: t.name },
+      num: 6,
+      id: "sec-topology",
+      desc: "How drives nest into hosts, racks, rooms and data centers \u2014 and across which level copies are spread.",
+      right: /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, favC.name.split(" ")[1] || favC.name, " \xB7 ", t.name)
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { maxWidth: 640 } }, box(0)),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, fontSize: 12, color: C.dim, fontFamily: "ui-monospace, monospace", lineHeight: 1.7 } }, "Ceph places each of the ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, spec.width), " copies/chunks of ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, t.scheme), " onto a ", /* @__PURE__ */ React.createElement("b", { style: { color: C.accent } }, "different ", t.domainLevel), ". So you need \u2265 ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, spec.width), " ", t.domainLevel, "s to store data, and ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, spec.width + 1), " to self-heal. You currently declare ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, t.domainsAvailable), " ", t.domainLevel, "(s) available."),
+    misaligned && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11.5, color: C.amber, fontFamily: "ui-monospace, monospace" } }, "\u26A0 This cluster has ", n0(alignTarget), " ", t.domainLevel, 's, but "Domains available" says ', t.domainsAvailable, " \u2014 they should match."), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: () => updateTier(selTier, {
+          domainsAvailable: alignTarget,
+          _alignUndo: { domainsAvailable: t.domainsAvailable },
+          _alignLabel: `Domains available ${t.domainsAvailable} \u2192 ${alignTarget}`
+        }),
+        title: `Set "Domains available" to the actual ${t.domainLevel} count (${alignTarget}).`,
+        style: { background: "transparent", color: C.accent, border: `1px solid ${C.accent}66`, borderRadius: 5, padding: "2px 8px", fontSize: 11, fontWeight: 700, fontFamily: "ui-monospace, monospace", whiteSpace: "nowrap" }
+      },
+      "Align \u2192 ",
+      n0(alignTarget)
+    )),
+    t._alignUndo && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8 } }, /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: () => updateTier(selTier, { ...t._alignUndo, _alignUndo: null, _alignLabel: null }),
+        title: "Restore Domains available to its value before Align.",
+        style: { background: "transparent", color: C.dim, border: `1px solid ${C.line}`, borderRadius: 5, padding: "2px 8px", fontSize: 10.5, fontWeight: 600, fontFamily: "ui-monospace, monospace", whiteSpace: "nowrap" }
+      },
+      "\u21BA Undo align (",
+      t._alignLabel,
+      ")"
+    )),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, "Highlighted box = your chosen failure-domain level. OSD / host / rack counts come from the favoured chassis building this tier; room & data center are structural levels you provision yourself.", /* @__PURE__ */ React.createElement("div", { style: { marginTop: 6 } }, "Note: ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, '"Domains available"'), " = how many independent ", t.domainLevel, "s your layout provides \u2014 a different thing from how many you ", /* @__PURE__ */ React.createElement("i", null, "need"), " (\u2265 width + 1 = ", spec.width + 1, "). At ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, "host"), " level each node is its own host, so it equals the node count (that's why Align is offered here). At ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, "rack / room / data-center"), " level it's your own choice of how many you spread nodes across \u2014 not derived from the node count \u2014 so no auto-align is offered."))
+  );
+}
+function RackNetworkSection({ chassis, tiers, selTier, assum, setAssum }) {
+  const t = tiers[selTier] || tiers[0];
+  const favC = chassisFor(t, chassis);
+  const setA = (k, v) => setAssum((p) => ({ ...p, [k]: v }));
+  const r = chassisForTier(favC, t);
+  const nodes = r.nodes;
+  const u = Math.max(1, favC.u);
+  const uPerRack = Math.max(u, Math.round(assum.uPerRack));
+  const nodesPerRack = Math.max(1, Math.floor(uPerRack / u));
+  const densePackRacks = Math.max(1, Math.ceil(nodes / nodesPerRack));
+  const spec = schemeSpec(t);
+  const domainsNeeded = spec.width + 1;
+  const level = t.domainLevel;
+  const ports = nodes * 2;
+  const portsPerSwitch = Math.max(1, Math.round(assum.portsPerSwitch));
+  const switches = Math.max(1, Math.ceil(ports / portsPerSwitch));
+  const distribute = (n, k) => {
+    const base = Math.floor(n / k), rem = n % k;
+    return Array.from({ length: k }, (_, i) => base + (i < rem ? 1 : 0));
+  };
+  let unitLabel, groups, spread;
+  if (level === "host") {
+    unitLabel = "Rack";
+    spread = false;
+    groups = [];
+    let left = nodes;
+    for (let i = 0; i < densePackRacks; i++) {
+      const c = Math.min(nodesPerRack, left);
+      groups.push(c);
+      left -= c;
+    }
+  } else {
+    spread = true;
+    unitLabel = level === "rack" ? "Rack" : level === "room" ? "Room" : "DC";
+    const fdCount = level === "rack" ? Math.max(domainsNeeded, densePackRacks) : Math.max(domainsNeeded, 1);
+    groups = distribute(nodes, fdCount);
+  }
+  const cols = groups.length;
+  const slotMax = Math.max(nodesPerRack, ...groups);
+  const nodesPerDomain = Math.ceil(nodes / cols);
+  const racksPerDomain = Math.max(1, Math.ceil(nodesPerDomain / nodesPerRack));
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Rack & network layout \xB7 spread by failure-domain level (favoured chassis)",
+      accent: C.accent,
+      scope: { kind: "tier", name: t.name },
+      num: 7,
+      id: "sec-rack",
+      desc: "Where the nodes physically sit \u2014 racks (or rooms/DCs) and how many switches.",
+      right: /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, favC.name.split(" ")[1] || favC.name, " \xB7 ", t.name, " \xB7 ", nodes, " nodes \xD7 ", u, "U")
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(120px,1fr))", gap: 12, marginBottom: 12, maxWidth: 380 } }, /* @__PURE__ */ React.createElement(Field, { label: "Rack height (U)", tip: "Usable rack units per rack (typical 42 or 48)." }, /* @__PURE__ */ React.createElement(GreenNum, { value: assum.uPerRack, step: 1, onChange: (v) => setA("uPerRack", v) })), /* @__PURE__ */ React.createElement(Field, { label: "Ports / switch", tip: "Usable ports per leaf switch, for estimating switch count." }, /* @__PURE__ */ React.createElement(GreenNum, { value: assum.portsPerSwitch, step: 1, onChange: (v) => setA("portsPerSwitch", v) }))),
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: C.dim, marginBottom: 12, fontFamily: "ui-monospace, monospace", lineHeight: 1.7 } }, "Failure domain = ", /* @__PURE__ */ React.createElement("b", { style: { color: C.accent } }, level), " \xB7 ", spread ? /* @__PURE__ */ React.createElement(React.Fragment, null, "spread across ", /* @__PURE__ */ React.createElement("b", { style: { color: C.accent } }, cols), " ", unitLabel.toLowerCase(), "s (need \u2265 width+1 = ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, domainsNeeded), ")", level !== "rack" ? /* @__PURE__ */ React.createElement(React.Fragment, null, " \xB7 \u2248", nodesPerDomain, " nodes / ", racksPerDomain, " rack(s) each") : "") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("b", { style: { color: C.accent } }, nodes), " hosts packed into ", /* @__PURE__ */ React.createElement("b", { style: { color: C.accent } }, cols), " rack", cols > 1 ? "s" : "", " (", nodesPerRack, "/rack)"), " \xB7 network: ", /* @__PURE__ */ React.createElement("b", { style: { color: C.accent } }, ports), " ports \u2192 ", /* @__PURE__ */ React.createElement("b", { style: { color: C.accent } }, switches), " leaf switch", switches > 1 ? "es" : ""),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 14, flexWrap: "wrap" } }, groups.map((cnt, ci) => /* @__PURE__ */ React.createElement("div", { key: ci, style: { width: 84, border: `1px solid ${spread ? C.accent : C.line}`, borderRadius: 6, background: spread ? "rgba(56,189,248,.06)" : C.panel2, padding: 6 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: spread ? C.accent : C.faint, textAlign: "center", marginBottom: 4, fontFamily: "ui-monospace, monospace", fontWeight: spread ? 700 : 400 } }, unitLabel, " ", ci + 1), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column-reverse", gap: 2, height: 200 } }, Array.from({ length: slotMax }).map((_, slot) => /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        key: slot,
+        title: slot < cnt ? `Node ${slot + 1}` : "empty",
+        style: {
+          flex: "1 1 0",
+          background: slot < cnt ? C.accent : C.panel,
+          border: `1px solid ${C.line}`,
+          borderRadius: 2,
+          opacity: slot < cnt ? 0.85 : 0.25
+        }
+      }
+    ))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10, color: C.dim, textAlign: "center", marginTop: 4, fontFamily: "ui-monospace, monospace" } }, cnt, " node", cnt !== 1 ? "s" : "")))),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, spread ? /* @__PURE__ */ React.createElement(React.Fragment, null, "Each column is one ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, level), "-level failure domain; Ceph places at most one copy/chunk per domain, so nodes are spread evenly across \u2265 width+1 of them. Switch the failure-domain level in the tier inputs to re-group.") : /* @__PURE__ */ React.createElement(React.Fragment, null, "Failure domain is the host, so racks are just physical space (dense-packed). Blue = provisioned nodes, faint = free space."), " ", "Switches are a rough leaf count from 2 ports/node; no spine / oversubscription modelled.")
+  );
+}
+function NetworkSection({ chassis, tiers, selTier, assum }) {
+  const t = tiers[selTier] || tiers[0];
+  const favC = chassisFor(t, chassis);
+  const nodes = chassisForTier(favC, t).nodes;
+  const frontEnd = t.frontEnd;
+  const backend = t.frontEnd * t.eastWest;
+  const portsPerSwitch = Math.max(1, Math.round(assum.portsPerSwitch));
+  const pubSwitches = Math.max(1, Math.ceil(nodes / portsPerSwitch));
+  const cluSwitches = Math.max(1, Math.ceil(nodes / portsPerSwitch));
+  const nicGb = favC.netGb;
+  const pubPerNodeGb = nodes ? frontEnd / nodes * 8 : 0;
+  const cluPerNodeGb = nodes ? backend / nodes * 8 : 0;
+  const pubUtil = nicGb ? pubPerNodeGb / nicGb * 100 : 0;
+  const cluUtil = nicGb ? cluPerNodeGb / nicGb * 100 : 0;
+  const shown = Math.max(1, Math.min(nodes, 7));
+  const xs = Array.from({ length: shown }, (_, i) => 90 + 560 / shown * (i + 0.5));
+  const nodeW = 46, nodeH = 40, nodeY = 150;
+  const panel = (accent, title, subtitle, rows, util, utilTip) => /* @__PURE__ */ React.createElement("div", { style: { border: `1px solid ${C.line}`, borderTop: `2px solid ${accent}`, borderRadius: 8, padding: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { color: accent, fontWeight: 700, fontSize: 12, fontFamily: "ui-monospace, monospace" } }, title), /* @__PURE__ */ React.createElement("div", { style: { color: C.faint, fontSize: 10.5, fontFamily: "ui-monospace, monospace", marginBottom: 8 } }, subtitle), rows.map(([k, v, tip]) => /* @__PURE__ */ React.createElement("div", { key: k, style: { display: "flex", justifyContent: "space-between", fontSize: 12, padding: "2px 0", fontFamily: "ui-monospace, monospace" } }, /* @__PURE__ */ React.createElement("span", { style: { color: C.dim } }, tip ? /* @__PURE__ */ React.createElement(Tip, { text: tip }, k) : k), /* @__PURE__ */ React.createElement("span", { style: { color: C.ink, fontWeight: 600 } }, v))), /* @__PURE__ */ React.createElement("div", { style: { height: 8, background: C.panel2, borderRadius: 4, overflow: "hidden", marginTop: 8 } }, /* @__PURE__ */ React.createElement("div", { style: { width: Math.min(100, util) + "%", height: "100%", background: util > 100 ? C.red : util > 75 ? C.amber : accent } })), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 10.5, color: util > 100 ? C.red : C.faint, fontFamily: "ui-monospace, monospace", marginTop: 3 } }, /* @__PURE__ */ React.createElement(Tip, { text: utilTip }, util.toFixed(0), "% of the ", nicGb, " Gb/s NIC per node", util > 100 ? " \u2014 over capacity, add/upgrade NICs" : "")));
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Network planes \xB7 public (clients) vs cluster (east-west)",
+      accent: C.accent,
+      scope: { kind: "tier", name: t.name },
+      num: 8,
+      id: "sec-network",
+      desc: "The two Ceph networks \u2014 client-facing (public) and internal replication (cluster) \u2014 and how loaded each is.",
+      right: /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, favC.name.split(" ")[1] || favC.name, " \xB7 ", t.name, " \xB7 ", nodes, " nodes")
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { width: "100%", overflowX: "auto" } }, /* @__PURE__ */ React.createElement("svg", { viewBox: "0 0 700 285", width: "100%", style: { maxWidth: 760 } }, /* @__PURE__ */ React.createElement("rect", { x: "300", y: "10", width: "100", height: "30", rx: "6", fill: C.panel2, stroke: C.line }), /* @__PURE__ */ React.createElement("text", { x: "350", y: "29", textAnchor: "middle", fontSize: "11", fill: C.ink, fontFamily: "ui-monospace, monospace" }, "Clients / users"), /* @__PURE__ */ React.createElement("line", { x1: "350", y1: "40", x2: "350", y2: "74", stroke: C.green, strokeWidth: "2" }), /* @__PURE__ */ React.createElement("rect", { x: "70", y: "74", width: "560", height: "30", rx: "6", fill: "rgba(34,197,94,.12)", stroke: C.green }), /* @__PURE__ */ React.createElement("text", { x: "82", y: "93", fontSize: "11", fill: C.green, fontWeight: "700", fontFamily: "ui-monospace, monospace" }, "PUBLIC \xB7 front-end"), /* @__PURE__ */ React.createElement("text", { x: "618", y: "93", textAnchor: "end", fontSize: "11", fill: C.green, fontFamily: "ui-monospace, monospace" }, d1(frontEnd), " GB/s \xB7 ", pubSwitches, " switch", pubSwitches > 1 ? "es" : ""), xs.map((x, i) => /* @__PURE__ */ React.createElement("line", { key: "p" + i, x1: x, y1: "104", x2: x, y2: nodeY, stroke: C.green, strokeWidth: "1.5", opacity: "0.55" })), xs.map((x, i) => /* @__PURE__ */ React.createElement("g", { key: "n" + i }, /* @__PURE__ */ React.createElement("rect", { x: x - nodeW / 2, y: nodeY, width: nodeW, height: nodeH, rx: "4", fill: C.panel2, stroke: C.accent }), /* @__PURE__ */ React.createElement("text", { x, y: nodeY + 24, textAnchor: "middle", fontSize: "9", fill: C.dim, fontFamily: "ui-monospace, monospace" }, "OSD"))), nodes > shown && /* @__PURE__ */ React.createElement("text", { x: "662", y: nodeY + 25, textAnchor: "middle", fontSize: "11", fill: C.faint, fontFamily: "ui-monospace, monospace" }, "\xD7", nodes), xs.map((x, i) => /* @__PURE__ */ React.createElement("line", { key: "c" + i, x1: x, y1: nodeY + nodeH, x2: x, y2: "222", stroke: C.accent, strokeWidth: "1.5", opacity: "0.55" })), /* @__PURE__ */ React.createElement("rect", { x: "70", y: "222", width: "560", height: "30", rx: "6", fill: "rgba(56,189,248,.12)", stroke: C.accent }), /* @__PURE__ */ React.createElement("text", { x: "82", y: "241", fontSize: "11", fill: C.accent, fontWeight: "700", fontFamily: "ui-monospace, monospace" }, "CLUSTER \xB7 back-end \xB7 east-west \xD7", t.eastWest), /* @__PURE__ */ React.createElement("text", { x: "618", y: "241", textAnchor: "end", fontSize: "11", fill: C.accent, fontFamily: "ui-monospace, monospace" }, d1(backend), " GB/s \xB7 ", cluSwitches, " switch", cluSwitches > 1 ? "es" : ""))),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 12 }, className: "split" }, panel(
+      C.green,
+      "EXTERNAL \xB7 Public network",
+      "Client reads/writes \u2194 OSDs",
+      [
+        ["Aggregate throughput", `${d1(frontEnd)} GB/s`, "Total client read/write throughput for the whole cluster \u2014 from the tier's 'Front-end (GB/s)' input."],
+        ["Per node", `${d1(pubPerNodeGb)} Gb/s`, "Client bandwidth each node must sustain = aggregate \xF7 node count \xD7 8 (GB/s \u2192 Gb/s)."],
+        ["Ports (1/node)", n0(nodes), "One public NIC port per node (node count comes from the tier target built on the favoured chassis)."],
+        ["Leaf switches", `${n0(pubSwitches)} \xD7 ${portsPerSwitch}p`, "Nodes \xF7 ports-per-switch, rounded up. 'Ports / switch' is set in Rack & network layout."]
+      ],
+      pubUtil,
+      `Per-node client demand (${d1(pubPerNodeGb)} Gb/s) vs the node's NIC (${nicGb} Gb/s = the 'Net Gb' of the favoured chassis, edited in Chassis Comparison).`
+    ), panel(
+      C.accent,
+      "INTERNAL \xB7 Cluster network",
+      "OSD \u2194 OSD replication, recovery, heartbeats",
+      [
+        ["Aggregate throughput", `${d1(backend)} GB/s`, "Total east-west throughput = Front-end \xD7 east-west multiplier (both in the tier inputs). Replication + recovery traffic."],
+        ["Per node", `${d1(cluPerNodeGb)} Gb/s`, "East-west bandwidth each node must sustain = aggregate \xF7 node count \xD7 8."],
+        ["Ports (1/node)", n0(nodes), "One cluster NIC port per node."],
+        ["Leaf switches", `${n0(cluSwitches)} \xD7 ${portsPerSwitch}p`, "Nodes \xF7 ports-per-switch, rounded up."]
+      ],
+      cluUtil,
+      `Per-node east-west demand (${d1(cluPerNodeGb)} Gb/s) vs the node's NIC (${nicGb} Gb/s = 'Net Gb' of the favoured chassis). Over 100% means the NIC can't carry it.`
+    )),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, "The internal (cluster) plane carries ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, t.eastWest, "\xD7"), " the client traffic: every write is replicated across OSDs, and recovery/backfill after a failure is heavy \u2014 that's why the cluster network usually needs the fat pipes, not the public one.", /* @__PURE__ */ React.createElement("div", { style: { marginTop: 6 } }, "Where the numbers come from: ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, "Front-end (GB/s)"), " and ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, "Back-end east-west \xD7"), " in the tier inputs (left) drive the aggregate throughput; the ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, "Net Gb"), " cell of the ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, "favoured (\u2605) chassis"), " in Chassis Comparison sets the per-node NIC (the load bars); ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, "Ports / switch"), " in Rack & network layout sets the switch count. Change the favoured chassis and its node count & NIC update here."))
+  );
+}
+var fmtH = (h) => !Number.isFinite(h) ? "\u2014" : h < 48 ? h.toFixed(1) + " h" : (h / 24).toFixed(1) + " days";
+function RebuildSection({ chassis, tiers, selTier, assum, setAssum }) {
+  const t = tiers[selTier] || tiers[0];
+  const favC = chassisFor(t, chassis);
+  const setA = (k, v) => setAssum((p) => ({ ...p, [k]: v }));
+  const nodes = chassisForTier(favC, t).nodes;
+  const dpn = favC.drivesPerNode;
+  const drive = favC.driveSize;
+  const spec = schemeSpec(t);
+  const tol = spec.tolerated;
+  const rec = Math.max(1e-3, assum.recoveryGBps);
+  const dataDisk = drive * t.fullness;
+  const dataNode = dpn * drive * t.fullness;
+  const hrs = (tb) => tb * 1e3 / rec / 3600;
+  const rbDisk = hrs(dataDisk), rbNode = hrs(dataNode);
+  const totalOSDs = nodes * dpn;
+  const afr = assum.driveAFRpct / 100;
+  const expFail = (h) => totalOSDs * afr * (h / 8760);
+  const eNode = expFail(rbNode);
+  const risk = tol >= 3 ? ["green", "LOW"] : tol === 2 ? rbNode > 48 ? ["amber", "MEDIUM"] : ["green", "LOW"] : rbNode > 24 ? ["red", "HIGH"] : ["amber", "MEDIUM"];
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Rebuild time & risk \xB7 recovery window after a failure (favoured chassis)",
+      accent: C.red,
+      scope: { kind: "tier", name: t.name },
+      num: 13,
+      id: "sec-rebuild",
+      desc: "How long recovery takes after a drive or node dies, and the chance of a second failure during it.",
+      right: /* @__PURE__ */ React.createElement(Badge, { tone: risk[0] }, risk[1], " RISK")
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 8, fontFamily: "ui-monospace, monospace" } }, "ASSUMPTIONS \xB7 green cells are editable"),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(150px,1fr))", gap: 12, marginBottom: 14, maxWidth: 400 } }, /* @__PURE__ */ React.createElement(Field, { label: "Recovery throughput (GB/s)", tip: "How fast the cluster re-replicates lost data. Ceph throttles recovery to protect client IO, so this is usually a few GB/s, not the full network." }, /* @__PURE__ */ React.createElement(GreenNum, { value: assum.recoveryGBps, step: 0.5, onChange: (v) => setA("recoveryGBps", v) })), /* @__PURE__ */ React.createElement(Field, { label: "Drive AFR (%/yr)", tip: "Annualized failure rate per drive \u2014 the chance one drive dies in a year. ~0.5\u20132% typical." }, /* @__PURE__ */ React.createElement(GreenNum, { value: assum.driveAFRpct, step: 0.1, onChange: (v) => setA("driveAFRpct", v) }))),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 20px" } }, /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: `Data on one drive = drive size \xD7 fullness = ${d1(drive)} \xD7 ${t.fullness.toFixed(2)}. Time = data \xF7 recovery throughput.` }, "Rebuild after 1 drive loss"), v: fmtH(rbDisk) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: `Data on one node = drives/node \xD7 drive size \xD7 fullness = ${dpn} \xD7 ${d1(drive)} \xD7 ${t.fullness.toFixed(2)}.` }, "Rebuild after 1 node loss"), v: fmtH(rbNode), tone: C.accent }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: "How many simultaneous domain failures the scheme survives without data loss (= parity/extra copies)." }, "Failures tolerated (tol)"), v: n0(tol) }), /* @__PURE__ */ React.createElement(Row, { k: /* @__PURE__ */ React.createElement(Tip, { text: `Rough expected number of extra drive failures somewhere in the cluster during the ${fmtH(rbNode)} node-rebuild window = OSDs \xD7 AFR \xD7 window/year.` }, "Expected extra failures in window"), v: eNode.toFixed(3), tone: eNode > tol ? C.red : C.ink })),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, "Wide nodes (many big drives) take longer to rebuild, and a longer window raises the chance of a second failure before redundancy is restored. Lower risk by using a scheme that tolerates more failures (higher tol), smaller drives, or faster recovery. Simplified model \u2014 real recovery time depends on Ceph throttles, load, and network.")
+  );
+}
+function FailureSimSection({ chassis, tiers, selTier }) {
+  const t = tiers[selTier] || tiers[0];
+  const spec = schemeSpec(t);
+  const tol = spec.tolerated, width = spec.width;
+  const domains = Math.max(1, Math.round(t.domainsAvailable));
+  const [lost, setLost] = useState(0);
+  const capped = Math.min(lost, domains);
+  const remaining = domains - capped;
+  let tone, label, msg;
+  if (capped === 0) {
+    tone = "green";
+    label = "HEALTHY";
+    msg = `All ${domains} ${t.domainLevel}s up \xB7 full redundancy (can lose ${tol}).`;
+  } else if (capped <= tol) {
+    const canHeal = remaining >= width;
+    tone = "amber";
+    label = "DEGRADED";
+    msg = `Data intact, ${tol - capped} failure(s) of headroom left. ${canHeal ? `${remaining} ${t.domainLevel}s remain \u2014 can self-heal.` : `Only ${remaining} left (< width ${width}) \u2014 cannot fully re-protect.`}`;
+  } else {
+    tone = "red";
+    label = "DATA LOSS";
+    msg = `Lost ${capped} > tolerated ${tol} \u2014 some data is unrecoverable.`;
+  }
+  const shownDomains = Math.min(domains, 48);
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Failure simulator \xB7 what happens as you lose failure domains",
+      accent: C.amber,
+      scope: { kind: "tier", name: t.name },
+      num: 14,
+      id: "sec-failure",
+      desc: "Drag to fail domains and see whether data stays available, degrades, or is lost.",
+      right: /* @__PURE__ */ React.createElement(Badge, { tone }, label)
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: C.dim, marginBottom: 10, fontFamily: "ui-monospace, monospace" } }, "Scheme ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, t.scheme), " tolerates ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, tol), " simultaneous ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, t.domainLevel), " failure(s) \xB7 ", domains, " available"),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", { style: { fontSize: 12, color: C.dim, fontFamily: "ui-monospace, monospace" } }, "Domains lost:"), /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "range",
+        min: 0,
+        max: domains,
+        step: 1,
+        value: capped,
+        onChange: (e) => setLost(parseInt(e.target.value)),
+        style: { width: 260 }
+      }
+    ), /* @__PURE__ */ React.createElement("span", { style: { fontSize: 14, color: C.ink, fontWeight: 700, fontFamily: "ui-monospace, monospace" } }, capped, " / ", domains)),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 12 } }, Array.from({ length: shownDomains }).map((_, i) => {
+      const dead = i < capped;
+      return /* @__PURE__ */ React.createElement("div", { key: i, title: dead ? "failed" : "up", style: {
+        width: 22,
+        height: 26,
+        borderRadius: 3,
+        background: dead ? "rgba(239,68,68,.25)" : "rgba(34,197,94,.18)",
+        border: `1px solid ${dead ? C.red : C.green}`
+      } });
+    }), domains > shownDomains && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, alignSelf: "center", fontFamily: "ui-monospace, monospace" } }, "\u2026", domains)),
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: tone === "red" ? C.red : tone === "amber" ? C.amber : C.green, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, msg)
+  );
+}
+function GrowthSection({ tiers, results, selTier, updateTier }) {
+  const [mode, setMode] = useState("tier");
+  const t = tiers[selTier] || tiers[0];
+  const r = results[selTier] || results[0];
+  const cluster = mode === "cluster";
+  const cap = cluster ? results.reduce((a, x) => a + x.provUsable, 0) : r.provUsable;
+  const used0 = Math.max(0, cluster ? tiers.reduce((a, x) => a + (x.usedStartTB || 0), 0) : t.usedStartTB || 0);
+  const g = Math.max(0, cluster ? tiers.reduce((a, x) => a + (x.growthTBmo || 0), 0) : t.growthTBmo || 0);
+  const addAt = 0.8 * cap;
+  const monthsToAdd = g > 0 ? Math.max(0, (addAt - used0) / g) : Infinity;
+  const monthsToFull = g > 0 ? Math.max(0, (cap - used0) / g) : Infinity;
+  const horizon = Number.isFinite(monthsToFull) ? Math.max(6, Math.ceil(monthsToFull * 1.25)) : 36;
+  const data = [];
+  for (let m = 0; m <= horizon; m++) data.push({ m, Used: Math.round(used0 + g * m), Capacity: Math.round(cap) });
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Capacity growth runway \xB7 when you fill up",
+      accent: C.green,
+      scope: cluster ? { kind: "cluster" } : { kind: "tier", name: t.name },
+      num: 15,
+      id: "sec-growth",
+      desc: "Given how fast data grows, when this fills to 80% and when it's full.",
+      right: /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, cluster ? "whole cluster" : t.name, " \xB7 cap ", d1(cap), " TB usable")
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 12 } }, [["tier", "This tier"], ["cluster", "Whole cluster"]].map(([m, lbl]) => /* @__PURE__ */ React.createElement("button", { key: m, onClick: () => setMode(m), style: {
+      background: mode === m ? `${C.accent}18` : "transparent",
+      color: mode === m ? C.accent : C.dim,
+      border: `1px solid ${mode === m ? C.accent : C.line}`,
+      borderRadius: 6,
+      padding: "4px 12px",
+      fontSize: 12,
+      fontWeight: 600,
+      fontFamily: "ui-monospace, monospace"
+    } }, lbl))),
+    cluster ? /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: C.dim, marginBottom: 12, fontFamily: "ui-monospace, monospace" } }, "Summed over all tiers: ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, d1(used0), " TB"), " stored, growing ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, d1(g), " TB/mo"), ' \u2014 edit start & growth per tier in "This tier" mode.') : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 8, fontFamily: "ui-monospace, monospace" } }, "ASSUMPTIONS \xB7 green cells are editable"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(150px,1fr))", gap: 12, marginBottom: 12, maxWidth: 400 } }, /* @__PURE__ */ React.createElement(Field, { label: "Data already stored (TB)", tip: "How much usable data is on this tier today. Per-tier \u2014 each tier has its own." }, /* @__PURE__ */ React.createElement(GreenNum, { value: t.usedStartTB, step: 10, onChange: (v) => updateTier(selTier, { usedStartTB: v }) })), /* @__PURE__ */ React.createElement(Field, { label: "Growth (TB / month)", tip: "How fast stored data grows on this tier. Per-tier \u2014 switch tier tabs to plan each." }, /* @__PURE__ */ React.createElement(GreenNum, { value: t.growthTBmo, step: 5, onChange: (v) => updateTier(selTier, { growthTBmo: v }) })))),
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12.5, color: C.dim, marginBottom: 10, fontFamily: "ui-monospace, monospace", lineHeight: 1.7 } }, "Reach ", /* @__PURE__ */ React.createElement("b", { style: { color: C.amber } }, "80% (add nodes)"), " in ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, Number.isFinite(monthsToAdd) ? monthsToAdd.toFixed(1) + " mo" : "\u2014"), " \xB7 ", /* @__PURE__ */ React.createElement("b", { style: { color: C.red } }, "full"), " in ", /* @__PURE__ */ React.createElement("b", { style: { color: C.ink } }, Number.isFinite(monthsToFull) ? monthsToFull.toFixed(1) + " mo" : "never at this rate")),
+    /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 250 }, /* @__PURE__ */ React.createElement(LineChart, { data, margin: { top: 8, right: 20, bottom: 16, left: 4 } }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: C.line, strokeDasharray: "3 3" }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "m", tick: { fill: C.dim, fontSize: 10 }, label: { value: "months", position: "insideBottom", offset: -6, fill: C.faint, fontSize: 10 } }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: C.dim, fontSize: 10 }, width: 54, tickFormatter: (v) => n0(v) }), /* @__PURE__ */ React.createElement(
+      RTooltip,
+      {
+        contentStyle: { background: "#0b0f14", border: `1px solid ${C.line}`, borderRadius: 6 },
+        labelStyle: { color: C.ink, fontWeight: 700 },
+        itemStyle: { color: C.ink },
+        labelFormatter: (v) => `month ${v}`,
+        formatter: (v, k) => [n0(v) + " TB", k]
+      }
+    ), /* @__PURE__ */ React.createElement(Legend, { wrapperStyle: { fontSize: 11 } }), /* @__PURE__ */ React.createElement(Line, { type: "monotone", dataKey: "Used", stroke: C.green, dot: false, strokeWidth: 2.5 }), /* @__PURE__ */ React.createElement(Line, { type: "monotone", dataKey: "Capacity", stroke: C.red, dot: false, strokeWidth: 1.5, strokeDasharray: "5 4" }))),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, "Green = stored data over time; red dashed = usable ceiling (", cluster ? "all tiers summed" : "this tier", "). Where green crosses red you're full. Plan procurement lead time before the 80% mark. ", cluster ? "Cluster view sums every tier's start, growth and ceiling \u2014 an aggregate estimate; individual tiers may fill at different times." : /* @__PURE__ */ React.createElement(React.Fragment, null, "Start & growth are ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, "per tier"), " \u2014 switch tier tabs to plan Fast and Capacity separately."))
+  );
+}
+function BomSection({ chassis, tiers, selTier, assum, setAssum }) {
+  const t = tiers[selTier] || tiers[0];
+  const favC = chassisFor(t, chassis);
+  const setA = (k, v) => setAssum((p) => ({ ...p, [k]: v }));
+  const nodes = chassisForTier(favC, t).nodes;
+  const u = Math.max(1, favC.u);
+  const uPerRack = Math.max(u, Math.round(assum.uPerRack));
+  const nodesPerRack = Math.max(1, Math.floor(uPerRack / u));
+  const racks = Math.max(1, Math.ceil(nodes / nodesPerRack));
+  const portsPerSwitch = Math.max(1, Math.round(assum.portsPerSwitch));
+  const switches = 2 * Math.max(1, Math.ceil(nodes / portsPerSwitch));
+  const isEC = t.scheme.startsWith("EC") || t.scheme === "Custom EC";
+  const serverCost = nodes * favC.price;
+  const ecCpu = isEC ? serverCost * (assum.ecCpuPct / 100) : 0;
+  const portCostTotal = nodes * 2 * assum.portCost;
+  const switchCost = switches * assum.switchPrice;
+  const rackCost = racks * assum.rackPrice;
+  const capex = serverCost + ecCpu + portCostTotal + switchCost + rackCost;
+  const energy = nodes * assum.wattsPerNode * assum.pue * 8760 * assum.years / 1e3 * assum.eurPerKwh;
+  const grand = capex + energy;
+  const lines = [
+    ["Storage servers", `${favC.name}`, nodes, favC.price, serverCost, false],
+    ...isEC ? [["EC CPU premium", `${assum.ecCpuPct}% of servers`, "\u2014", "\u2014", ecCpu, false]] : [],
+    ["Network ports / cabling", `2/node \xB7 \u20AC${n0(assum.portCost)}/port`, nodes * 2, assum.portCost, portCostTotal, false],
+    ["Leaf switches", `${portsPerSwitch}-port \xB7 public + cluster`, switches, assum.switchPrice, switchCost, false],
+    ["Racks", `${uPerRack}U`, racks, assum.rackPrice, rackCost, false],
+    ["Capex subtotal", "", "", "", capex, true],
+    [`Energy (${assum.years}-yr)`, `${d1(nodes * assum.wattsPerNode * assum.pue / 1e3)} kW \xD7 ${assum.years}yr`, "\u2014", "\u2014", energy, false],
+    ["Grand total (capex + energy)", "", "", "", grand, true]
+  ];
+  const exportBom = () => {
+    const rows = [["Item", "Detail", "Qty", "Unit \u20AC", "Subtotal \u20AC"]];
+    lines.forEach(([item, detail, qty, unit, sub]) => rows.push([item, detail, qty, unit === "\u2014" ? "" : unit, Math.round(sub)]));
+    const csv = rows.map((r) => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "ceph-bom.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: "Procurement BOM \xB7 priced bill of materials (favoured chassis)",
+      accent: C.accent,
+      scope: { kind: "tier", name: t.name },
+      num: 16,
+      id: "sec-bom",
+      desc: "An itemized, priced shopping list for building this tier.",
+      right: /* @__PURE__ */ React.createElement("button", { onClick: exportBom, style: btn(C.accent) }, "Export BOM (CSV)")
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: C.faint, marginBottom: 8, fontFamily: "ui-monospace, monospace" } }, "PRICES \xB7 green cells are editable"),
+    /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(2, minmax(150px,1fr))", gap: 12, marginBottom: 14, maxWidth: 400 } }, /* @__PURE__ */ React.createElement(Field, { label: "\u20AC / leaf switch", tip: "Price of one leaf switch." }, /* @__PURE__ */ React.createElement(GreenNum, { value: assum.switchPrice, step: 500, onChange: (v) => setA("switchPrice", v) })), /* @__PURE__ */ React.createElement(Field, { label: "\u20AC / rack", tip: "Price of one rack (PDUs, cabling, install)." }, /* @__PURE__ */ React.createElement(GreenNum, { value: assum.rackPrice, step: 100, onChange: (v) => setA("rackPrice", v) }))),
+    /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto" } }, /* @__PURE__ */ React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12.5, fontFamily: "ui-monospace, monospace" } }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { style: { color: C.dim, borderBottom: `1px solid ${C.line}` } }, ["Item", "Detail", "Qty", "Unit \u20AC", "Subtotal \u20AC"].map((h, i) => /* @__PURE__ */ React.createElement("th", { key: h, style: { padding: "8px 10px", textAlign: i < 2 ? "left" : "right", fontWeight: 600 } }, h)))), /* @__PURE__ */ React.createElement("tbody", null, lines.map(([item, detail, qty, unit, sub, bold], i) => /* @__PURE__ */ React.createElement("tr", { key: i, style: { borderBottom: `1px solid ${C.panel2}`, background: bold ? "rgba(56,189,248,.05)" : "transparent" } }, /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", color: bold ? C.accent : C.ink, fontWeight: bold ? 700 : 400 } }, item), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", color: C.faint } }, detail), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", textAlign: "right", color: C.dim } }, qty === "" || qty === "\u2014" ? "" : n0(qty)), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", textAlign: "right", color: C.dim } }, unit === "" || unit === "\u2014" ? "" : "\u20AC" + n0(unit)), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", textAlign: "right", color: bold ? C.accent : C.ink, fontWeight: bold ? 700 : 600 } }, "\u20AC", n0(sub))))))),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, "Capex = servers (+ EC CPU premium if EC) + network ports/cabling + leaf switches (both planes) + racks \u2014 same components as Power & the cluster roll-up. Energy is ", assum.years, "-year electricity at the power assumptions. Scoped to the selected tier built on its chassis.")
+  );
+}
+function ClusterRollupSection({ chassis, tiers, assum }) {
+  const portsPerSwitch = Math.max(1, Math.round(assum.portsPerSwitch));
+  const rows = tiers.map((tt) => {
+    const favC = chassisFor(tt, chassis);
+    const u = Math.max(1, favC.u);
+    const uPerRack = Math.max(u, Math.round(assum.uPerRack));
+    const nodesPerRack = Math.max(1, Math.floor(uPerRack / u));
+    const spec = schemeSpec(tt);
+    const isEC = tt.scheme.startsWith("EC") || tt.scheme === "Custom EC";
+    const ss = sizeScheme(favC, spec, isEC, tt.usableTarget, tt.fullness, assum);
+    const switches = 2 * Math.max(1, Math.ceil(ss.nodes / portsPerSwitch));
+    const racks = Math.max(1, Math.ceil(ss.nodes / nodesPerRack));
+    const capex = ss.capex + switches * assum.switchPrice + racks * assum.rackPrice;
+    const energy = ss.energyYr * assum.years;
+    return { name: tt.name, scheme: tt.scheme, chassis: favC.name.split(" ")[1] || favC.name, nodes: ss.nodes, usable: ss.usable, powerKw: ss.powerKw, capex, energy, total: capex + energy };
+  });
+  const sum = rows.reduce((a, r) => ({
+    nodes: a.nodes + r.nodes,
+    usable: a.usable + r.usable,
+    powerKw: a.powerKw + r.powerKw,
+    capex: a.capex + r.capex,
+    energy: a.energy + r.energy,
+    total: a.total + r.total
+  }), { nodes: 0, usable: 0, powerKw: 0, capex: 0, energy: 0, total: 0 });
+  const chartData = rows.map((r) => ({ name: r.name, Capex: +(r.capex / 1e3).toFixed(1), Energy: +(r.energy / 1e3).toFixed(1) }));
+  const cell = { padding: "6px 10px", textAlign: "right", fontFamily: "ui-monospace, monospace" };
+  return /* @__PURE__ */ React.createElement(
+    Card,
+    {
+      title: `Cluster cost roll-up \xB7 all tiers, ${assum.years}-year TCO (favoured chassis)`,
+      accent: C.amber,
+      scope: { kind: "cluster" },
+      num: 17,
+      id: "sec-rollup",
+      desc: "Total cost of the whole cluster \u2014 every tier on its own chassis, summed.",
+      right: /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: C.faint, fontFamily: "ui-monospace, monospace" } }, tiers.length, " tier", tiers.length > 1 ? "s" : "", " \xB7 each on its own chassis")
+    },
+    /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto" } }, /* @__PURE__ */ React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12.5, fontFamily: "ui-monospace, monospace" } }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { style: { color: C.dim, borderBottom: `1px solid ${C.line}` } }, ["Tier", "Scheme", "Chassis", "Nodes", "Usable TB", "Power kW", "Capex \u20AC", `Energy \u20AC (${assum.years}yr)`, "TCO \u20AC"].map((h, i) => /* @__PURE__ */ React.createElement("th", { key: h, style: { padding: "8px 10px", textAlign: i < 3 ? "left" : "right", fontWeight: 600 } }, h)))), /* @__PURE__ */ React.createElement("tbody", null, rows.map((r, i) => /* @__PURE__ */ React.createElement("tr", { key: i, style: { borderBottom: `1px solid ${C.panel2}` } }, /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", color: C.ink } }, r.name), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", color: C.faint } }, r.scheme), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", color: C.accent } }, r.chassis), /* @__PURE__ */ React.createElement("td", { style: cell }, n0(r.nodes)), /* @__PURE__ */ React.createElement("td", { style: cell }, d1(r.usable)), /* @__PURE__ */ React.createElement("td", { style: cell }, d1(r.powerKw)), /* @__PURE__ */ React.createElement("td", { style: cell }, "\u20AC", n0(r.capex)), /* @__PURE__ */ React.createElement("td", { style: cell }, "\u20AC", n0(r.energy)), /* @__PURE__ */ React.createElement("td", { style: { ...cell, color: C.amber, fontWeight: 700 } }, "\u20AC", n0(r.total)))), /* @__PURE__ */ React.createElement("tr", { style: { background: "rgba(245,158,11,.06)" } }, /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", color: C.amber, fontWeight: 700 } }, "CLUSTER"), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px" } }), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px" } }), /* @__PURE__ */ React.createElement("td", { style: { ...cell, color: C.accent, fontWeight: 700 } }, n0(sum.nodes)), /* @__PURE__ */ React.createElement("td", { style: { ...cell, color: C.green, fontWeight: 700 } }, d1(sum.usable)), /* @__PURE__ */ React.createElement("td", { style: { ...cell, fontWeight: 700 } }, d1(sum.powerKw)), /* @__PURE__ */ React.createElement("td", { style: { ...cell, fontWeight: 700 } }, "\u20AC", n0(sum.capex)), /* @__PURE__ */ React.createElement("td", { style: { ...cell, fontWeight: 700 } }, "\u20AC", n0(sum.energy)), /* @__PURE__ */ React.createElement("td", { style: { ...cell, color: C.amber, fontWeight: 700 } }, "\u20AC", n0(sum.total)))))),
+    /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: C.dim, margin: "10px 0", fontFamily: "ui-monospace, monospace" } }, "Whole-cluster ", assum.years, "-yr TCO: ", /* @__PURE__ */ React.createElement("b", { style: { color: C.amber } }, "\u20AC", n0(sum.total)), " = capex \u20AC", n0(sum.capex), " + energy \u20AC", n0(sum.energy), " \xB7 ", /* @__PURE__ */ React.createElement("b", { style: { color: C.green } }, "\u20AC", n0(sum.usable > 0 ? sum.total / sum.usable : 0), "/usable-TB")),
+    /* @__PURE__ */ React.createElement(ResponsiveContainer, { width: "100%", height: 220 }, /* @__PURE__ */ React.createElement(BarChart, { data: chartData }, /* @__PURE__ */ React.createElement(CartesianGrid, { stroke: C.line, strokeDasharray: "3 3" }), /* @__PURE__ */ React.createElement(XAxis, { dataKey: "name", tick: { fill: C.dim, fontSize: 11 } }), /* @__PURE__ */ React.createElement(YAxis, { tick: { fill: C.dim, fontSize: 11 } }), /* @__PURE__ */ React.createElement(
+      RTooltip,
+      {
+        cursor: { fill: "rgba(255,255,255,0.06)" },
+        contentStyle: { background: "#0b0f14", border: `1px solid ${C.line}`, borderRadius: 6 },
+        labelStyle: { color: C.ink, fontWeight: 700 }
+      }
+    ), /* @__PURE__ */ React.createElement(Legend, { wrapperStyle: { fontSize: 11 } }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "Capex", stackId: "a", fill: C.accent }), /* @__PURE__ */ React.createElement(Bar, { dataKey: "Energy", stackId: "a", fill: C.amber }))),
+    /* @__PURE__ */ React.createElement("div", { style: { marginTop: 8, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace", lineHeight: 1.6 } }, "Sums every tier's cost (bars in \u20AC thousands). Each tier is sized on its own scheme and built on ", /* @__PURE__ */ React.createElement("b", { style: { color: C.dim } }, "its own chassis"), " (set per tier in the Inputs card or the Chassis table \u2605). Capex = servers + EC CPU + network + switches + racks; energy = ", assum.years, "-yr electricity. Now a mixed cluster (e.g. NVMe Fast + HDD Capacity) rolls up correctly.")
+  );
+}
+var BIND_TONE = { Capacity: "neutral", Read: "amber", Write: "red", "Self-heal": "green" };
+var BIND_HELP = {
+  Capacity: "Capacity sets the node count \u2014 pure 'will it fit' math. Fewer nodes: bigger drives, more drives/node, a lower-overhead scheme (EC), or a smaller usable target.",
+  Read: "\u26A0 Read throughput sets the node count: you need this many spindles to reach the read GB/s target. Fewer nodes: faster drives (higher per-HDD MB/s) or a lower read target.",
+  Write: "\u26A0 Write throughput sets the node count, amplified by the scheme's write penalty (WA). Fewer nodes: faster drives (per-HDD MB/s), a lower write target, or a scheme with less write amplification (e.g. replication \xD72, or wider EC).",
+  "Self-heal": "Self-heal floor (width + 1) sets the node count \u2014 you already have more nodes than capacity or throughput needs, purely for resilience. Fewer nodes only by choosing a narrower scheme (lower width), which reduces fault tolerance."
+};
+function PerfSection({ perf, setPerf, chassis }) {
+  const setP = (k, v) => setPerf((p) => ({ ...p, [k]: v }));
+  const favName = (chassis.find((c) => c.fav) || chassis[0])?.name;
+  const grid = chassis.map((c) => ({
+    chassis: c,
+    cells: PERF_SCHEMES.map((s) => ({ scheme: s, ...perfCell(c, s, perf) }))
+  }));
+  const isRecommended = (cName, s) => cName === favName && s === "Replication \xD73";
+  return /* @__PURE__ */ React.createElement(Card, { title: "Performance-driven Options \xB7 throughput binds, not just capacity", accent: C.red, scope: { kind: "standalone" }, num: 18, id: "sec-perf", desc: "When read/write speed \u2014 not capacity \u2014 decides how many nodes you need. Uses its own inputs." }, /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 10, marginBottom: 16 } }, [
+    ["per-HDD MB/s", "perHddMBps", 10],
+    ["Write GB/s", "writeGBps", 0.1],
+    ["Read GB/s", "readGBps", 0.5],
+    ["Usable TB", "usable", 10],
+    ["Fullness", "fullness", 0.01],
+    ["Drive TB", "driveSize", 0.1]
+  ].map(([lbl, k, step]) => /* @__PURE__ */ React.createElement(Field, { key: k, label: lbl }, /* @__PURE__ */ React.createElement(Num, { value: perf[k], step, onChange: (v) => setP(k, v) })))), /* @__PURE__ */ React.createElement("div", { style: { overflowX: "auto" } }, /* @__PURE__ */ React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 12, fontFamily: "ui-monospace, monospace" } }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", { style: { color: C.dim, borderBottom: `1px solid ${C.line}` } }, /* @__PURE__ */ React.createElement("th", { style: { padding: "8px 10px", textAlign: "left" } }, "Chassis \xD7 Scheme"), /* @__PURE__ */ React.createElement("th", { style: { padding: "8px 6px", textAlign: "right" } }, /* @__PURE__ */ React.createElement(Tip, { below: true, text: "Drives needed for capacity, rounded up: usable \xD7 raw multiplier \xF7 fullness \xF7 drive size." }, "HDD cap")), /* @__PURE__ */ React.createElement("th", { style: { padding: "8px 6px", textAlign: "right" } }, /* @__PURE__ */ React.createElement(Tip, { below: true, text: "Drives needed to reach the read-throughput target, rounded up: read GB/s \xF7 single-drive speed." }, "HDD read")), /* @__PURE__ */ React.createElement("th", { style: { padding: "8px 6px", textAlign: "right" } }, /* @__PURE__ */ React.createElement(Tip, { below: true, text: "Drives needed to reach the write-throughput target (includes the scheme's write amplification), rounded up: write GB/s \xD7 write-amplification \xF7 single-drive speed." }, "HDD write")), /* @__PURE__ */ React.createElement("th", { style: { padding: "8px 6px", textAlign: "right" } }, /* @__PURE__ */ React.createElement(Tip, { below: true, text: "Minimum nodes for the scheme to self-heal after one loss: width + 1." }, "Self-heal")), /* @__PURE__ */ React.createElement("th", { style: { padding: "8px 6px", textAlign: "right", color: C.accent } }, "Nodes"), /* @__PURE__ */ React.createElement("th", { style: { padding: "8px 6px", textAlign: "right" } }, "Total HDDs"), /* @__PURE__ */ React.createElement("th", { style: { padding: "8px 6px", textAlign: "right" } }, "Usable TB"), /* @__PURE__ */ React.createElement("th", { style: { padding: "8px 10px", textAlign: "center" } }, "Binds"))), /* @__PURE__ */ React.createElement("tbody", null, grid.map(
+    ({ chassis: chassis2, cells }) => cells.map((cell, j) => {
+      const rec = isRecommended(chassis2.name, cell.scheme);
+      return /* @__PURE__ */ React.createElement("tr", { key: chassis2.id + cell.scheme, style: {
+        borderBottom: `1px solid ${C.panel2}`,
+        background: rec ? "rgba(34,197,94,.09)" : "transparent"
+      } }, /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px" } }, j === 0 && /* @__PURE__ */ React.createElement("span", { style: { color: C.faint } }, chassis2.name), /* @__PURE__ */ React.createElement("span", { style: { color: rec ? C.green : C.ink, fontWeight: rec ? 700 : 400, marginLeft: j === 0 ? 8 : 0 } }, j === 0 ? " \xB7 " : "", cell.scheme, rec ? " \u2605" : "")), /* @__PURE__ */ React.createElement("td", { style: cellS(cell.binding === "Capacity"), title: cell.binding === "Capacity" ? BIND_HELP.Capacity : void 0 }, n0(cell.capHDD)), /* @__PURE__ */ React.createElement("td", { style: cellS(cell.binding === "Read"), title: cell.binding === "Read" ? BIND_HELP.Read : void 0 }, n0(cell.readHDD)), /* @__PURE__ */ React.createElement("td", { style: cellS(cell.binding === "Write"), title: cell.binding === "Write" ? BIND_HELP.Write : void 0 }, n0(cell.writeHDD)), /* @__PURE__ */ React.createElement("td", { style: cellS(cell.binding === "Self-heal"), title: cell.binding === "Self-heal" ? BIND_HELP["Self-heal"] : void 0 }, n0(cell.selfHealNodes)), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px", textAlign: "right", color: C.accent, fontWeight: 700 } }, n0(cell.nodesFinal)), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px", textAlign: "right" } }, n0(cell.totalHDDs)), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px", textAlign: "right" } }, d1(cell.provUsable)), /* @__PURE__ */ React.createElement("td", { style: { padding: "6px 10px", textAlign: "center" } }, /* @__PURE__ */ React.createElement(Tip, { below: true, alignRight: true, text: BIND_HELP[cell.binding] }, /* @__PURE__ */ React.createElement(Badge, { tone: BIND_TONE[cell.binding] }, cell.binding))));
+    })
+  )))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10, fontSize: 11.5, color: C.faint, fontFamily: "ui-monospace, monospace" } }, "\u2605 recommended combo \xB7 highlighted cell in each row is the constraint that drove the node count."));
+}
+var cellS = (binding) => ({
+  padding: "6px",
+  textAlign: "right",
+  color: binding ? "#fff" : C.dim,
+  background: binding ? "rgba(239,68,68,.18)" : "transparent",
+  fontWeight: binding ? 700 : 400,
+  borderRadius: binding ? 4 : 0
+});
+export {
+  App as default
+};
+
+const el = document.getElementById("root");
+el.innerHTML = "";
+createRoot(el).render(React.createElement(App));
+</script>
+</body>
+</html>
